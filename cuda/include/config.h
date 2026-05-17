@@ -6,7 +6,7 @@
 // Compile-time constants (hard upper bounds for static array sizing)
 // ============================================================================
 
-// Maximum sequence length (scores[] in smem is sized to this at launch time)
+// Maximum sequence length (KV logical length bound; chunked attention avoids O(seq) scratch)
 constexpr int MAX_SEQ_LEN      = 1024;
 // Paged KV cache block size (tokens per physical block)
 constexpr int KV_BLOCK_SIZE    = 16;
@@ -21,6 +21,8 @@ constexpr int WARP_SIZE        = 32;
 constexpr int BLOCK_THREADS    = 256;
 // Max transformer layers (supports LLaMA-7B/13B with 32/40 layers)
 constexpr int MAX_LAYERS       = 40;
+// Column tile for SwiGLU projections (stored in repurposed buffers; never materialize full d_ff)
+constexpr int MLP_FF_TILE      = 256;
 
 // Default vocabulary for the built-in dummy integer tokenizer
 constexpr int DEFAULT_VOCAB_SIZE = 256;
@@ -68,27 +70,30 @@ inline ModelConfig make_target_config() {
 //
 // Shared memory layout per kernel block:
 //   hidden   [d_model]       -- token hidden state, persists across layers
+//
+// Scratch for model_layer_forward / model_output (after hidden[]) :
 //   normed   [d_model]       -- RMSNorm output scratch
 //   q_all    [d_model]       -- Q projection (all heads concatenated)
 //   kv_temp  [d_model]       -- K/V projection temp; also output-proj output
-//   scores   [MAX_SEQ_LEN]   -- per-head attention scores
-//   attn_out [d_model]       -- per-head V accumulation (full concat output)
-//   gate_buf [d_ff]          -- SwiGLU gate projection
-//   up_buf   [d_ff]          -- SwiGLU up projection
-//   scratch  [WARP_SIZE]     -- block-reduction scratch (warp results)
+//   attn_out [d_model]       -- per-head V accumulation + Wo temp staging
+//   scratch  tail            -- softmax / RMSNorm warp reductions (+ padding)
 //
-// Total = 5*d_model + MAX_SEQ_LEN + 2*d_ff + WARP_SIZE floats.
-// Example (GPT-2 small, d=768, d_ff=3072):
-//   5*768 + 1024 + 2*3072 + 32 = 11040 floats = 44 KB  (under 48 KB limit)
-// Example (target preset, d=256, d_ff=1024):
-//   5*256 + 1024 + 2*1024 + 32 = 4352 floats = 17 KB
+// Attention: FlashAttention-style *streaming softmax* over KV blocks — at most KV_BLOCK_SIZE
+// logits materialized at a time in the scratch tail (no full-seq score vector).
+// MLP: column-tiles W_gate/W_up/W_down — only O(min(d_ff,d_model_tile)) intermediates live in smem.
+//
+// After layers, global_argmax overlays the first min(size, 2*BLOCK_THREADS) floats of
+// the scratch region — size must never be smaller than that for tiny d_model.
+//
+// Bytes = hidden + max( 4*d_model + WARP_SIZE, 2*BLOCK_THREADS ) floats (in scratch).
+// Example (Llama-ish, d=2048): (2048 + 8216) floats * 4 < 96 KiB.
 // ============================================================================
 
 inline size_t compute_smem_bytes(const ModelConfig& cfg) {
-    size_t floats = (size_t)cfg.d_model * 5     // hidden+normed+q_all+kv_temp+attn_out
-                  + MAX_SEQ_LEN                  // scores (compile-time bound)
-                  + (size_t)cfg.d_ff * 2         // gate_buf + up_buf
-                  + WARP_SIZE;                   // reduction scratch
+    size_t scratch_core  = (size_t)4 * cfg.d_model + WARP_SIZE;
+    size_t argmax_pad    = (size_t)BLOCK_THREADS * 2;
+    size_t scratch_floats_max = scratch_core > argmax_pad ? scratch_core : argmax_pad;
+    size_t floats = (size_t)cfg.d_model + scratch_floats_max;
     return floats * sizeof(float);
 }
 

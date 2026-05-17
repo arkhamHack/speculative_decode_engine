@@ -182,6 +182,24 @@ void device_matvec(const float* x, const half* W,
     __syncthreads();
 }
 
+// Column slice: out[jc] = x @ W[:, col0+jc], jc in [0, ncol).
+// ncol may be smaller than blockDim.x; out must hold ncol floats contiguously.
+__device__ __forceinline__
+void device_matvec_cols(const float* x, const half* W,
+                        int d_in, int d_out,
+                        int col0, int ncol,
+                        float* out) {
+    int tid = threadIdx.x;
+    for (int jc = tid; jc < ncol; jc += blockDim.x) {
+        float acc = 0.0f;
+        int col   = col0 + jc;
+        for (int row = 0; row < d_in; row++)
+            acc += x[row] * __half2float(W[row * d_out + col]);
+        out[jc] = acc;
+    }
+    __syncthreads();
+}
+
 // ============================================================================
 // Scalar half->float element load helper (vectorised load left as TODO)
 // ============================================================================

@@ -83,10 +83,10 @@ static void parse_args(Args& args, int argc, char** argv) {
 // ============================================================================
 
 static void print_tokens(const char* label, const int* tokens, int n) {
+    // Web UI parsing (runner._parse_token_list) requires digits/spaces only after ':' on
+    // this line — no "..." truncation, or n>20 yields an empty parsed token list.
     printf("%s [%d tokens]: ", label, n);
-    int show = (n < 20) ? n : 20;
-    for (int i = 0; i < show; i++) printf("%d ", tokens[i]);
-    if (n > 20) printf("...");
+    for (int i = 0; i < n; i++) printf("%d ", tokens[i]);
     printf("\n");
 }
 

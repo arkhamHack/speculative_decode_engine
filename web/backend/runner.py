@@ -78,11 +78,24 @@ def decode_token_ids_to_text(tokenizer_model: str, ids: list[int]) -> str:
 # ── Output parser ─────────────────────────────────────────────────────────────
 
 def _parse_token_list(line: str) -> list[int]:
-    """Extract bracketed integer list from a 'Label [N tokens]: ...' line."""
-    m = re.search(r":\s*([\d\s]+)$", line)
-    if not m:
+    """Extract integers after ':' from 'Label [N tokens]: id id ...' output lines."""
+    line = line.rstrip("\r\n")
+    # Old spec_decode truncated with '...'; strip so end-of-line grammar still works.
+    if "..." in line:
+        line = line.split("...", 1)[0].rstrip()
+    idx = line.find(":")
+    if idx < 0:
         return []
-    return [int(x) for x in m.group(1).split() if x.strip()]
+    tail = line[idx + 1 :].strip()
+    if not tail:
+        return []
+    ids: list[int] = []
+    for tok in tail.split():
+        try:
+            ids.append(int(tok))
+        except ValueError:
+            break
+    return ids
 
 
 def parse_output(stdout: str) -> dict:

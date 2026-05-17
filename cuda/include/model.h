@@ -68,8 +68,8 @@ bool model_load_weights(ModelWeights& model, const char* path,
 // ============================================================================
 // Device functions  (called from within a single-block CUDA kernel)
 //
-// All device functions operate on the calling block's shared memory.
-// smem = pointer to the scratch region in shared[], after hidden[].
+// All device functions operate on the calling block's shared scratch after hidden[]
+// (streaming attention + tiled MLP keep large temporaries factorized/tiled — no seq×d_ff arrays).
 // ============================================================================
 
 // Embedding lookup: hidden[d] = token_embedding[token_id, :]

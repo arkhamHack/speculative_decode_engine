@@ -22,9 +22,8 @@ static inline void cuda_configure_kernel_dynamic_smem(K kernel, size_t smem_byte
 // Shared memory layout (dynamic — sized at launch via compute_smem_bytes())
 //
 //   shared[0          .. d_model)         hidden      [d_model]
-//   shared[d_model    .. end)             scratch for model_layer_forward
-//                                         (normed, q_all, kv_temp, scores,
-//                                          attn_out, gate_buf, up_buf, scratch)
+//   shared[d_model .. end]   scratch for layers + final RMSNorm
+//                               (streaming attention + tiled MLP — see model.cu)
 //
 // Logits are written to a global-memory buffer (g_logits) allocated by the
 // host wrapper.  This removes the vocab_size limit from shared memory and
@@ -43,10 +42,11 @@ __global__ void single_token_decode_kernel(
         float* g_logits, int* out) {
     extern __shared__ float shared[];
     int d = model.cfg.d_model;
-    float* hidden = shared;           // [d_model]
-    float* smem   = shared + d;       // scratch (rest of smem)
+    float* hidden = shared;
+    float* smem   = shared + d;
 
-    int next = model_forward(model, kv, token_id, seq_len, hidden, g_logits, smem);
+    int next =
+        model_forward(model, kv, token_id, seq_len, hidden, g_logits, smem);
     if (threadIdx.x == 0) *out = next;
 }
 
@@ -386,7 +386,7 @@ __global__ void megakernel_speculative_kernel(
         KVCache* p_draft_kv, KVCache* p_target_kv,
         const int* prompt, int prompt_len,
         int max_new_tokens, int spec_k,
-        float* g_logits,   // vocab_size floats (sized for larger model)
+        float* g_logits,
         GenerationResult* result) {
     const ModelWeights& draft_model  = *p_draft_model;
     const ModelWeights& target_model = *p_target_model;

@@ -344,29 +344,15 @@ __device__ void model_embed(const ModelWeights& model, int token_id,
 //       V[d] = normed @ Wv
 //   3.  Apply RoPE to Q and K at absolute position current_seq_len (Llama/HF layout).
 //   4.  Append rotated K and V to paged KV cache (per slot: K[d], V[d])
-//   5.  For head h in [0, n_heads):
-//         a. scores[p] = (Q[h*dph:(h+1)*dph] · K_p[h*dph:(h+1)*dph]) / sqrt(dph)
-//            for each cached position p
-//         b. softmax(scores)
-//         c. attn_out[h*dph:(h+1)*dph] = Σ_p scores[p] * V_p[h*dph:(h+1)*dph]
-//   6.  hidden += attn_out @ Wo          (residual)
+//   5.  For head h: stream over KV logical blocks (size KV_BLOCK_SIZE).  At most
+//       KV_BLOCK logits sit in smem at once; online softmax rescales the running
+//       weighted-V sum (no full-seq score vector in any memory tier).
+//   6.  hidden += attn_out @ Wo             (residual)
 //   7.  RMSNorm(hidden) -> normed
-//   8.  SwiGLU: gate = normed @ W_gate
-//               up   = normed @ W_up
-//               mlp_out = silu(gate) * up  @ W_down
-//   9.  hidden += mlp_out                (residual)
+//   8.  Tiled SwiGLU: slice W_gate/W_up by MLP_FF_TILE columns; silu(g)·u is fused
+//       per tile and accumulated into the down-projection (no gate/up of length d_ff).
+//   9.  hidden += down accumulation         (residual)
 //
-// Shared memory scratch layout (smem = shared + d):
-//   normed   [d]              RMSNorm output, also MLP scratch
-//   q_all    [d]              Q for all heads
-//   kv_temp  [d]              K (then V) temp; also output-proj output
-//   scores   [MAX_SEQ_LEN]    per-head attention weights
-//   attn_out [d]              accumulated per-head attention output
-//   gate_buf [d_ff]           SwiGLU gate
-//   up_buf   [d_ff]           SwiGLU up
-//   scratch  [WARP_SIZE]      block-reduction scratch
-// ============================================================================
-
 __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
                                     float* hidden, KVCache& kv,
                                     int current_seq_len, float* smem) {
@@ -378,119 +364,217 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
 
     const LayerWeights& lw = model.layers[layer_idx];
 
-    // --- Smem pointer arithmetic (runtime offsets, d and dff are runtime values) ---
     float* normed   = smem;
     float* q_all    = smem + d;
     float* kv_temp  = smem + 2 * d;
-    float* scores   = smem + 3 * d;              // [MAX_SEQ_LEN]
-    float* attn_out = smem + 3 * d + MAX_SEQ_LEN;
-    float* gate_buf = smem + 4 * d + MAX_SEQ_LEN;
-    float* up_buf   = smem + 4 * d + MAX_SEQ_LEN + dff;
-    float* scratch  = smem + 4 * d + MAX_SEQ_LEN + 2 * dff;
+    float* attn_out = smem + 3 * d;
+    float* scratch  = smem + 4 * d;
+
+    // Streaming softmax: tile logits fit in KV_BLOCK_SIZE slots — never seq-wide scores[]
+    float* blk_logits = scratch;
+
+    __shared__ float s_attn_m;
+    __shared__ float s_attn_l;
+    __shared__ float s_tile_m_new;
+    __shared__ float s_attn_alpha;
+    __shared__ float s_attn_inv_den;
+
+    int total_len =
+        current_seq_len + 1;  // includes the just-appended token
+    float scale   = rsqrtf((float)dph);
 
     // =========================================================
     // ---- Attention sub-layer --------------------------------
-    // =========================================================
-
-    // 1. RMSNorm
     device_rmsnorm(hidden, lw.rms_attn_weight, normed, d, scratch);
-
-    // 2. Full Q[d], K[d], V[d] via matrix-vector multiply
     device_matvec(normed, lw.Wq, q_all, d, d);
 
-    // K directly into attn_out (temporary storage before KV append)
     device_matvec(normed, lw.Wk, attn_out, d, d);
     __syncthreads();
 
-    // 3. Rotary embeddings on Q and K (absolute position = current_seq_len)
     rope_apply_heads_qk_inplace(q_all, attn_out, nh, dph, current_seq_len,
                                 model.cfg.rope_theta);
 
-    // V: compute into kv_temp (no RoPE on V)
     device_matvec(normed, lw.Wv, kv_temp, d, d);
     __syncthreads();
 
-    // 4. Append rotated K (attn_out) and V (kv_temp) to paged KV cache.
-    //    kv.d_head = d_model: the cache stores the full K[d] and V[d] per slot.
     kv_cache_append(kv, layer_idx, attn_out, kv_temp, current_seq_len);
 
-    // Clear attn_out for per-head accumulation
     for (int i = tid; i < d; i += blockDim.x) attn_out[i] = 0.0f;
     __syncthreads();
 
-    // 5. Multi-head attention
-    int total_len = current_seq_len + 1;  // includes the just-appended token
-    float scale   = rsqrtf((float)dph);
-
+    int n_logical_blocks =
+        (total_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
     for (int h = 0; h < nh; h++) {
-        int head_off = h * dph;  // offset in K/V/Q for this head
+        int head_off = h * dph;
 
-        // --- 5a. Compute attention scores (position-parallel) ---
-        for (int p = tid; p < total_len; p += blockDim.x) {
-            int lb = p / KV_BLOCK_SIZE, sl = p % KV_BLOCK_SIZE;
-            int pb = kv.layers[layer_idx].block_table[lb];
-            // KV block layout: [K: KV_BLOCK_SIZE * d halfs | V: KV_BLOCK_SIZE * d halfs]
-            const half* base  = kv.pool + (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
-            const half* k_src = base + sl * kv.d_head + head_off;
-
-            float dot = 0.0f;
-            for (int e = 0; e < dph; e++)
-                dot += q_all[head_off + e] * __half2float(k_src[e]);
-            scores[p] = dot * scale;
+        if (tid == 0) {
+            s_attn_m = -FLT_MAX;
+            s_attn_l = 0.f;
         }
+        for (int ei = tid; ei < dph; ei += blockDim.x)
+            attn_out[head_off + ei] = 0.f;
         __syncthreads();
 
-        // --- 5b. Softmax over scores[0..total_len-1] ---
-        block_softmax_inplace(scores, total_len, scratch);
+        for (int log_blk = 0; log_blk < n_logical_blocks; log_blk++) {
+            int p0 = log_blk * KV_BLOCK_SIZE;
 
-        // --- 5c. Weighted sum of V (element-parallel within this head) ---
-        for (int e = tid; e < dph; e += blockDim.x) {
-            int global_e = head_off + e;
-            float acc = 0.0f;
-            for (int p = 0; p < total_len; p++) {
-                int lb = p / KV_BLOCK_SIZE, sl = p % KV_BLOCK_SIZE;
-                int pb = kv.layers[layer_idx].block_table[lb];
-                const half* base  = kv.pool + (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
-                // V region starts after K region in each block
-                const half* v_src = base + KV_BLOCK_SIZE * kv.d_head + sl * kv.d_head;
-                acc += scores[p] * __half2float(v_src[global_e]);
+            // Logits Q·K/sqrt(d_ph) into blk_logits — only KV_BLOCK_SIZE wide
+            for (int sl = tid; sl < KV_BLOCK_SIZE; sl += blockDim.x) {
+                int p       = p0 + sl;
+                float logit = -FLT_MAX;
+                if (p < total_len) {
+                    int bidx = p / KV_BLOCK_SIZE, sl_kv = p % KV_BLOCK_SIZE;
+                    int pb   = kv.layers[layer_idx].block_table[bidx];
+                    const half* base =
+                        kv.pool +
+                        (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
+                    const half* k_src =
+                        base + sl_kv * kv.d_head + head_off;
+                    float dot = 0.f;
+                    for (int e = 0; e < dph; e++)
+                        dot +=
+                            q_all[head_off + e] *
+                            __half2float(k_src[e]);
+                    logit = dot * scale;
+                }
+                blk_logits[sl] = logit;
             }
-            attn_out[global_e] = acc;
+            __syncthreads();
+
+            if (tid == 0) {
+                float m_tile = -FLT_MAX;
+                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++) {
+                    int p = p0 + sl;
+                    if (p < total_len)
+                        m_tile =
+                            fmaxf(m_tile, blk_logits[sl]);
+                }
+
+                float m_prev  = s_attn_m;
+                float m_new   = fmaxf(m_prev, m_tile);
+                float alpha_u = (log_blk > 0) ? expf(m_prev - m_new) : 1.f;
+
+                float l_tile = 0.f;
+                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++) {
+                    int p = p0 + sl;
+                    if (p >= total_len) continue;
+                    l_tile += expf(blk_logits[sl] - m_new);
+                }
+
+                s_attn_m     = m_new;
+                s_attn_l     = alpha_u * s_attn_l + l_tile;
+                s_tile_m_new = m_new;
+                s_attn_alpha = alpha_u;
+            }
+            __syncthreads();
+
+            float rescale_prior = s_attn_alpha;
+            for (int ei = tid; ei < dph; ei += blockDim.x) {
+                int ge = head_off + ei;
+                attn_out[ge] *= rescale_prior;
+            }
+            __syncthreads();
+
+            float m_here = s_tile_m_new;
+            for (int ei = tid; ei < dph; ei += blockDim.x) {
+                int global_e = head_off + ei;
+                float acc_c  = 0.f;
+                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++) {
+                    int p = p0 + sl;
+                    if (p >= total_len) continue;
+                    float w =
+                        expf(blk_logits[sl] - m_here);
+                    int bidx =
+                        p / KV_BLOCK_SIZE, sl_kv = p % KV_BLOCK_SIZE;
+                    int pb = kv.layers[layer_idx].block_table[bidx];
+                    const half* base =
+                        kv.pool +
+                        (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
+                    const half* v_src =
+                        base +
+                        KV_BLOCK_SIZE * kv.d_head +
+                        sl_kv * kv.d_head;
+                    acc_c +=
+                        w * __half2float(v_src[global_e]);
+                }
+                attn_out[global_e] += acc_c;
+            }
+            __syncthreads();
         }
+
+        if (tid == 0)
+            s_attn_inv_den =
+                (s_attn_l > 1e-20f && isfinite(s_attn_l))
+                    ? (1.f / s_attn_l)
+                    : 0.f;
+
+        __syncthreads();
+        float norm_den = s_attn_inv_den;
+
+        for (int ei = tid; ei < dph; ei += blockDim.x) {
+            int ge = head_off + ei;
+            attn_out[ge] *= norm_den;
+        }
+
         __syncthreads();
     }
 
-    // 6. Output projection: attn_out[d] @ Wo[d,d] -> kv_temp[d]
     device_matvec(attn_out, lw.Wo, kv_temp, d, d);
 
-    // Residual
-    for (int i = tid; i < d; i += blockDim.x) hidden[i] += kv_temp[i];
+    for (int i = tid; i < d; i += blockDim.x)
+        hidden[i] += kv_temp[i];
     __syncthreads();
 
     // =========================================================
-    // ---- MLP sub-layer (SwiGLU) -----------------------------
+    // ---- MLP (tiled SwiGLU — no gate/up buffers of length d_ff)
     // =========================================================
 
-    // 6. RMSNorm
     device_rmsnorm(hidden, lw.rms_mlp_weight, normed, d, scratch);
 
-    // 7a. Gate and up projections (non-overlapping smem regions)
-    device_matvec(normed, lw.W_gate, gate_buf, d, dff);
-    device_matvec(normed, lw.W_up,   up_buf,   d, dff);
+    // After attention, attn_out[kv_temp] are dead; reuse accum in q_all
+    float* mlp_accum = q_all;
 
-    // 7b. SwiGLU activation:  silu(gate) * up
-    for (int i = tid; i < dff; i += blockDim.x) {
-        float g      = gate_buf[i];
-        float silu_g = g / (1.0f + expf(-g));
-        gate_buf[i]  = silu_g * up_buf[i];
-    }
+    int tile_ff = MLP_FF_TILE;
+    if (tile_ff > d) tile_ff = d;
+
+    for (int qi = tid; qi < d; qi += blockDim.x) mlp_accum[qi] = 0.f;
     __syncthreads();
 
-    // 7c. Down projection into normed
-    device_matvec(gate_buf, lw.W_down, normed, dff, d);
+    for (int r0 = 0; r0 < dff; r0 += tile_ff) {
+        int ncol =
+            tile_ff < (dff - r0) ? tile_ff : (dff - r0);
 
-    // 8. Residual
-    for (int i = tid; i < d; i += blockDim.x) hidden[i] += normed[i];
+        device_matvec_cols(normed, lw.W_gate, d, dff, r0, ncol,
+                           attn_out);
+        device_matvec_cols(normed, lw.W_up, d, dff, r0, ncol,
+                           kv_temp);
+
+        for (int jc = tid; jc < ncol; jc += blockDim.x) {
+            float g      = attn_out[jc];
+            float silu_g = g / (1.0f + expf(-g));
+            attn_out[jc] = silu_g * kv_temp[jc];
+        }
+
+        __syncthreads();
+
+        // Down-proj accumulation: normed holds output later — using mlp_accum
+        int out_d = d;
+        for (int oc = tid; oc < out_d;
+             oc += blockDim.x) {
+            float dot_d = 0.f;
+            for (int jc = 0; jc < ncol; jc++) {
+                int row = r0 + jc;
+                dot_d += attn_out[jc] *
+                         __half2float(lw.W_down[row * out_d + oc]);
+            }
+            mlp_accum[oc] += dot_d;
+        }
+
+        __syncthreads();
+    }
+
+    for (int i = tid; i < d; i += blockDim.x)
+        hidden[i] += mlp_accum[i];
     __syncthreads();
 }
 
@@ -504,9 +588,9 @@ __device__ void model_output(const ModelWeights& model,
     int d = model.cfg.d_model;
     int V = model.cfg.vocab_size;
 
-    // Reuse the normed and scratch regions from the smem scratch area
+    // Reuse normed; block reductions write into scratch at smem+d (after layers done)
     float* normed  = smem;           // [d]
-    float* scratch = smem + d;       // [WARP_SIZE]  (well within remaining smem)
+    float* scratch = smem + d;
 
     device_rmsnorm(hidden, model.rms_final_weight, normed, d, scratch);
     // Write logits directly to global memory (vocab_size may be >> shared memory)
@@ -529,6 +613,5 @@ __device__ int model_forward(const ModelWeights& model, KVCache& kv,
     model_output(model, hidden, g_logits, smem);
 
     // Argmax over global-memory logits.
-    // Use smem as scratch (2 * BLOCK_THREADS floats needed; smem >> that).
     return global_argmax(g_logits, model.cfg.vocab_size, smem);
 }
