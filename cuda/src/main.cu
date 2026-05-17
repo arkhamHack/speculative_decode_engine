@@ -18,6 +18,13 @@ struct Args {
     int    spec_k       = DEFAULT_SPEC_K;  // --k=N
     unsigned seed       = 42;             // --seed=N
     int    prompt_len   = 4;              // --prompt-len=N  (dummy tokenizer only)
+    bool   stochastic_spec = false;       // --stochastic-spec
+    float  draft_temp   = 1.f;            // --draft-temp=T
+    bool   adaptive_draft_temp = false;   // --adaptive-draft-temp
+    float  adapt_accept_target = 0.50f;   // --adapt-accept=R  ( EWMA centre, default 0.5 )
+    float  adapt_gain        = 0.055f;   // --adapt-gain=G
+    float  adapt_ewma_mix    = 0.25f;   // --adapt-ewma=M (smoothing λ on per-round rate)
+    unsigned spec_rng_seed = 12345;       // --spec-seed=N
     char   draft_path[512]  = "";         // --draft=path/to/draft.bin
     char   target_path[512] = "";         // --target=path/to/target.bin
     char   prompt_tok[512]  = "";         // --prompt-tok=path/to/prompt.tok
@@ -34,6 +41,13 @@ static void usage(const char* prog) {
         "  --k=N                 speculative draft depth (default: %d)\n"
         "  --seed=N              random weight seed (default: 42)\n"
         "  --prompt-len=N        dummy prompt length (default: 4)\n"
+        "  --stochastic-spec     distribution-matching speculative verify (mega + multi)\n"
+        "  --draft-temp=T        draft softmax temperature (default: 1)\n"
+        "  --adaptive-draft-temp EWMA nudge draft temp using --adapt-* heuristics\n"
+        "  --adapt-accept=R      EWMA acceptance target ∈ (0,1), default 0.5\n"
+        "  --adapt-gain=G        Δtemp per EWMA deviation step, default 0.055\n"
+        "  --adapt-ewma=M       mix weight for EWMA ∈ (0,1), default 0.25\n"
+        "  --spec-seed=N         RNG seed for stochastic spec (default: 12345)\n"
         "\n"
         "Real-model mode (requires SDEC weight files + tokenised prompt):\n"
         "  --draft=path.bin      draft model SDEC binary (from tools/export_model.py)\n"
@@ -58,6 +72,21 @@ static void parse_args(Args& args, int argc, char** argv) {
             args.spec_k = atoi(argv[i] + 4);
         } else if (strncmp(argv[i], "--seed=", 7) == 0) {
             args.seed = (unsigned)atoi(argv[i] + 7);
+        } else if (strcmp(argv[i], "--stochastic-spec") == 0) {
+            args.stochastic_spec = true;
+        } else if (strncmp(argv[i], "--draft-temp=", 13) == 0) {
+            args.draft_temp = static_cast<float>(atof(argv[i] + 13));
+        } else if (strcmp(argv[i], "--adaptive-draft-temp") == 0) {
+            args.adaptive_draft_temp = true;
+        } else if (strncmp(argv[i], "--adapt-accept=", 15) == 0) {
+            args.adapt_accept_target =
+                static_cast<float>(atof(argv[i] + 15));
+        } else if (strncmp(argv[i], "--adapt-gain=", 13) == 0) {
+            args.adapt_gain = static_cast<float>(atof(argv[i] + 13));
+        } else if (strncmp(argv[i], "--adapt-ewma=", 14) == 0) {
+            args.adapt_ewma_mix = static_cast<float>(atof(argv[i] + 14));
+        } else if (strncmp(argv[i], "--spec-seed=", 12) == 0) {
+            args.spec_rng_seed = (unsigned)atoi(argv[i] + 12);
         } else if (strncmp(argv[i], "--prompt-len=", 13) == 0) {
             args.prompt_len = atoi(argv[i] + 13);
         } else if (strncmp(argv[i], "--draft=", 8) == 0) {
@@ -110,10 +139,10 @@ int main(int argc, char** argv) {
     bool use_real = (args.draft_path[0] != '\0' &&
                      args.target_path[0] != '\0');
 
-    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d\n\n",
+    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d | stochastic_spec=%d\n\n",
            use_real ? "real-model" : "dummy",
            args.use_mega ? "megakernel" : "multi-kernel",
-           args.max_new, args.spec_k);
+           args.max_new, args.spec_k, args.stochastic_spec ? 1 : 0);
 
     // ---- Build / load models ----
     ModelWeights draft_model, target_model;
@@ -186,6 +215,13 @@ int main(int argc, char** argv) {
     params.max_new_tokens = args.max_new;
     params.spec_k         = args.spec_k;
     params.use_megakernel = args.use_mega;
+    params.stochastic_spec_decode  = args.stochastic_spec;
+    params.draft_temperature       = args.draft_temp;
+    params.adaptive_draft_temperature = args.adaptive_draft_temp;
+    params.stochastic_rng_seed     = args.spec_rng_seed;
+    params.stochastic_adapt_target_accept = args.adapt_accept_target;
+    params.stochastic_adapt_temp_gain     = args.adapt_gain;
+    params.stochastic_adapt_ewma_mix       = args.adapt_ewma_mix;
 
     // ---- Warmup ----
     printf("Warming up (first-call JIT and CUDA init)...\n");
@@ -263,22 +299,28 @@ int main(int argc, char** argv) {
     // Correctness verification
     // ==========================================================
     printf("\n=== Verification ===\n");
-    int min_len = h_baseline.n_generated < h_spec.n_generated
-                ? h_baseline.n_generated : h_spec.n_generated;
-    bool match  = (h_baseline.n_generated == h_spec.n_generated);
-    for (int i = 0; i < min_len && match; i++) {
-        if (h_baseline.output_tokens[i] != h_spec.output_tokens[i])
-            match = false;
-    }
-    printf("Output match: %s\n", match ? "PASS ✓" : "FAIL ✗");
-    if (!match) {
-        printf("  Lengths: baseline=%d spec=%d\n",
-               h_baseline.n_generated, h_spec.n_generated);
-        for (int i = 0; i < min_len; i++) {
-            if (h_baseline.output_tokens[i] != h_spec.output_tokens[i]) {
-                printf("  First mismatch @ [%d]: baseline=%d spec=%d\n",
-                       i, h_baseline.output_tokens[i], h_spec.output_tokens[i]);
-                break;
+    if (params.stochastic_spec_decode) {
+        printf("Byte-for-byte baseline match skipped "
+               "(stochastic speculative sampling is non-deterministic).\n");
+    } else {
+        int min_len = h_baseline.n_generated < h_spec.n_generated
+                    ? h_baseline.n_generated : h_spec.n_generated;
+        bool match  = (h_baseline.n_generated == h_spec.n_generated);
+        for (int i = 0; i < min_len && match; i++) {
+            if (h_baseline.output_tokens[i] != h_spec.output_tokens[i])
+                match = false;
+        }
+        printf("Output match: %s\n", match ? "PASS ✓" : "FAIL ✗");
+        if (!match) {
+            printf("  Lengths: baseline=%d spec=%d\n",
+                   h_baseline.n_generated, h_spec.n_generated);
+            for (int i = 0; i < min_len; i++) {
+                if (h_baseline.output_tokens[i] != h_spec.output_tokens[i]) {
+                    printf("  First mismatch @ [%d]: baseline=%d spec=%d\n",
+                           i, h_baseline.output_tokens[i],
+                           h_spec.output_tokens[i]);
+                    break;
+                }
             }
         }
     }

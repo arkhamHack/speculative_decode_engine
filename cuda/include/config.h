@@ -102,9 +102,24 @@ inline size_t compute_smem_bytes(const ModelConfig& cfg) {
 // ============================================================================
 
 struct GenerationParams {
-    int  max_new_tokens;
-    int  spec_k;           // draft tokens per speculation round
-    bool use_megakernel;   // false = multi-kernel loop, true = persistent megakernel
+    int    max_new_tokens;
+    int    spec_k;         // draft tokens per speculation round
+    bool   use_megakernel; // false = multi-kernel loop, true = persistent megakernel
+    //
+    // Stochastic speculative decoding (distribution-level acceptance with p,q and
+    // optional adjusted rejection sampling). Supported on multi-kernel and megakernel.
+    bool   stochastic_spec_decode = false;
+    float  draft_temperature      = 1.f; // softmax temperature for drafting / q probs
+    // Heuristic knobs to nudge draft temperature toward a target acceptance fraction
+    // ( EWMA ); cooler q often aligns better with the target chain and raises empirical α.
+    // Not theoretically exact versus tempered q unless q matches the verifier's policy.
+    bool   adaptive_draft_temperature = false;
+    float  min_draft_temperature      = 0.55f;
+    float  max_draft_temperature      = 1.2f;
+    float  stochastic_adapt_target_accept = 0.50f;
+    float  stochastic_adapt_temp_gain    = 0.055f;
+    float  stochastic_adapt_ewma_mix      = 0.25f;
+    unsigned stochastic_rng_seed       = 12345;
 };
 
 struct GenerationResult {

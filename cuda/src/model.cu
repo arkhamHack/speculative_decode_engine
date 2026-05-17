@@ -598,6 +598,22 @@ __device__ void model_output(const ModelWeights& model,
 }
 
 // ============================================================================
+// Device: full single-token forward (logits only, for sampling kernels)
+// ============================================================================
+
+__device__ void model_forward_logits(const ModelWeights& model, KVCache& kv,
+                                     int token_id, int current_seq_len,
+                                     float* hidden, float* g_logits,
+                                     float* smem) {
+    model_embed(model, token_id, hidden);
+
+    for (int l = 0; l < model.cfg.n_layers; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    model_output(model, hidden, g_logits, smem);
+}
+
+// ============================================================================
 // Device: full single-token forward pass
 // Returns the greedy next-token id.
 // ============================================================================
@@ -605,13 +621,8 @@ __device__ void model_output(const ModelWeights& model,
 __device__ int model_forward(const ModelWeights& model, KVCache& kv,
                              int token_id, int current_seq_len,
                              float* hidden, float* g_logits, float* smem) {
-    model_embed(model, token_id, hidden);
+    model_forward_logits(model, kv, token_id, current_seq_len, hidden,
+                         g_logits, smem);
 
-    for (int l = 0; l < model.cfg.n_layers; l++)
-        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
-
-    model_output(model, hidden, g_logits, smem);
-
-    // Argmax over global-memory logits.
     return global_argmax(g_logits, model.cfg.vocab_size, smem);
 }

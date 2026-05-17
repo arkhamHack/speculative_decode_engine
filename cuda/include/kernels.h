@@ -25,8 +25,8 @@ void multikernel_speculative(const ModelWeights& draft_model,
                              const GenerationParams& params);
 
 // ============================================================================
-// Persistent megakernel path: single kernel launch, zero CPU-GPU sync during
-// generation.  The loop runs entirely on the GPU.
+// Persistent megakernel path: typically a single launch (no CPU sync mid-decode).
+// Greedy speculative and stochastic speculative (--stochastic-spec) both route here.
 // ============================================================================
 
 void megakernel_baseline(const ModelWeights& target_model,

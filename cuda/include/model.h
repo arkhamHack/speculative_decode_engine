@@ -89,6 +89,12 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
 __device__ void model_output(const ModelWeights& model,
                              const float* hidden, float* g_logits, float* smem);
 
+// Full single-token forward: embed -> layers -> logits in g_logits (no argmax).
+__device__ void model_forward_logits(const ModelWeights& model, KVCache& kv,
+                                     int token_id, int current_seq_len,
+                                     float* hidden, float* g_logits,
+                                     float* smem);
+
 // Full single-token forward pass: embed -> layers -> output -> argmax.
 // g_logits: global-memory scratch for logits (vocab_size floats).
 // Returns the greedy next token id.
