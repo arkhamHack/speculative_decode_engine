@@ -7,11 +7,15 @@ Endpoints:
   POST /api/sweep    -- sweep k from 1..k_max, fixed mode
 """
 
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+
 from runner import run_benchmark
 
 app = FastAPI(title="Speculative Decode Explorer")
@@ -28,24 +32,70 @@ _executor = ThreadPoolExecutor(max_workers=4)
 
 # ── Request / Response models ──────────────────────────────────────────────────
 
-class RunRequest(BaseModel):
-    mode:        str  = Field("multi", pattern="^(multi|mega)$")
-    spec:        bool = True
-    max_tokens:  int  = Field(32,  ge=8,  le=128)
-    k:           int  = Field(4,   ge=1,  le=8)
-    seed:        int  = Field(42,  ge=0)
-    prompt_len:  int  = Field(4,   ge=1,  le=16)
+
+class ProductionFields(BaseModel):
+    """Optional real SDEC weights + HF tokenizer for decoded text."""
+
+    production: bool = False
+    draft_path: Optional[str] = None
+    target_path: Optional[str] = None
+    tokenizer_model: Optional[str] = None
+    prompt_text: Optional[str] = Field(None, max_length=100000)
+
+    @model_validator(mode="after")
+    def production_requires_paths(self):
+        if self.production:
+            missing = []
+            if not (self.draft_path and str(self.draft_path).strip()):
+                missing.append("draft_path")
+            if not (self.target_path and str(self.target_path).strip()):
+                missing.append("target_path")
+            if not (self.tokenizer_model and str(self.tokenizer_model).strip()):
+                missing.append("tokenizer_model")
+            if self.prompt_text is None or not str(self.prompt_text).strip():
+                missing.append("prompt_text")
+            if missing:
+                raise ValueError(
+                    "production mode requires non-empty: " + ", ".join(missing)
+                )
+        return self
 
 
-class SweepRequest(BaseModel):
-    mode:        str  = Field("multi", pattern="^(multi|mega)$")
-    max_tokens:  int  = Field(32,  ge=8,  le=128)
-    k_max:       int  = Field(8,   ge=2,  le=8)
-    seed:        int  = Field(42,  ge=0)
-    prompt_len:  int  = Field(4,   ge=1,  le=16)
+class RunRequest(ProductionFields):
+    mode: str = Field("multi", pattern="^(multi|mega)$")
+    spec: bool = True
+    max_tokens: int = Field(32, ge=8, le=128)
+    k: int = Field(4, ge=1, le=8)
+    seed: int = Field(42, ge=0)
+    prompt_len: int = Field(4, ge=1, le=16)
+
+
+class SweepRequest(ProductionFields):
+    mode: str = Field("multi", pattern="^(multi|mega)$")
+    max_tokens: int = Field(32, ge=8, le=128)
+    k_max: int = Field(8, ge=2, le=8)
+    seed: int = Field(42, ge=0)
+    prompt_len: int = Field(4, ge=1, le=16)
+
+
+def _bench_kwargs(req: RunRequest | SweepRequest) -> dict:
+    return {
+        "mode": req.mode,
+        "spec": getattr(req, "spec", True),
+        "max_tokens": req.max_tokens,
+        "k": getattr(req, "k", 4),
+        "seed": req.seed,
+        "prompt_len": req.prompt_len,
+        "production": req.production,
+        "draft_path": req.draft_path,
+        "target_path": req.target_path,
+        "tokenizer_model": req.tokenizer_model,
+        "prompt_text": req.prompt_text,
+    }
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 async def _run_async(**kwargs) -> dict:
     loop = asyncio.get_event_loop()
@@ -54,9 +104,11 @@ async def _run_async(**kwargs) -> dict:
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+
 @app.get("/api/health")
 async def health():
     from runner import find_exe
+
     exe = find_exe()
     return {
         "status": "ok",
@@ -68,14 +120,7 @@ async def health():
 
 @app.post("/api/run")
 async def run(req: RunRequest):
-    result = await _run_async(
-        mode=req.mode,
-        spec=req.spec,
-        max_tokens=req.max_tokens,
-        k=req.k,
-        seed=req.seed,
-        prompt_len=req.prompt_len,
-    )
+    result = await _run_async(**_bench_kwargs(req))
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
     return result
@@ -87,36 +132,44 @@ async def compare(req: RunRequest):
     combos = [
         ("multi", False),
         ("multi", True),
-        ("mega",  False),
-        ("mega",  True),
+        ("mega", False),
+        ("mega", True),
     ]
+    base_k = _bench_kwargs(req)
     tasks = [
         _run_async(
-            mode=mode, spec=spec,
-            max_tokens=req.max_tokens, k=req.k,
-            seed=req.seed, prompt_len=req.prompt_len,
+            **{**base_k, "mode": mode, "spec": spec},
         )
         for mode, spec in combos
     ]
     results = await asyncio.gather(*tasks)
-    return [
-        {"label": f"{'Mega' if mode == 'mega' else 'Multi'} {'+ Spec' if spec else ''}".strip(), **r}
-        for (mode, spec), r in zip(combos, results)
-    ]
+    out = []
+    for (mode, spec), r in zip(combos, results):
+        if "error" in r:
+            raise HTTPException(status_code=500, detail=r["error"])
+        out.append(
+            {
+                "label": f"{'Mega' if mode == 'mega' else 'Multi'} {'+ Spec' if spec else ''}".strip(),
+                **r,
+            }
+        )
+    return out
 
 
 @app.post("/api/sweep")
 async def sweep(req: SweepRequest):
     """Sweep k from 1..k_max with speculative enabled, return speedup per k."""
+    base = _bench_kwargs(req)
     tasks = [
         _run_async(
-            mode=req.mode, spec=True,
-            max_tokens=req.max_tokens, k=k,
-            seed=req.seed, prompt_len=req.prompt_len,
+            **{**base, "k": k, "spec": True},
         )
         for k in range(1, req.k_max + 1)
     ]
     results = await asyncio.gather(*tasks)
+    for r in results:
+        if "error" in r:
+            raise HTTPException(status_code=500, detail=r["error"])
     return [
         {
             "k": k,
@@ -130,4 +183,5 @@ async def sweep(req: SweepRequest):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

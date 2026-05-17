@@ -43,6 +43,9 @@ struct ModelConfig {
     int n_heads    = 4;    // must divide d_model
     int d_ff       = 512;
     int vocab_size = DEFAULT_VOCAB_SIZE;
+    // Llama-style RoPE base frequency (HF: Llama2 ~10000, Llama3 ~500000).
+    // SDEC v2 stores this in the file header; v1 loaders default to 10000.
+    float rope_theta = 10000.f;
 };
 
 // Per-head Q/K/V dimensionality (convenience helper)

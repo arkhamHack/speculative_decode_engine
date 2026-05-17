@@ -38,13 +38,13 @@ static void usage(const char* prog) {
         "Real-model mode (requires SDEC weight files + tokenised prompt):\n"
         "  --draft=path.bin      draft model SDEC binary (from tools/export_model.py)\n"
         "  --target=path.bin     target model SDEC binary\n"
-        "  --prompt-tok=path.tok tokenised prompt (from tools/tokenize.py encode)\n"
+        "  --prompt-tok=path.tok tokenised prompt (from tools/hf_tok.py encode)\n"
         "  --output-tok=path.tok write generated token ids here (decode with Python)\n"
         "\n"
         "Tool scripts (in tools/):\n"
         "  python tools/export_model.py <hf_model> <out.bin>   -- export HF model\n"
-        "  python tools/tokenize.py encode <model> <text> <out.tok>\n"
-        "  python tools/tokenize.py decode <model> <in.tok>\n",
+        "  python tools/hf_tok.py encode <model> <text> <out.tok>\n"
+        "  python tools/hf_tok.py decode <model> <in.tok>\n",
         prog, DEFAULT_SPEC_K);
 }
 
@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     if (use_real && args.output_tok[0] != '\0') {
         if (tok_save(args.output_tok, h_spec.output_tokens, h_spec.n_generated))
             printf("\nGenerated tokens saved to: %s\n", args.output_tok);
-        printf("Decode with: python tools/tokenize.py decode <model> %s\n",
+        printf("Decode with: python tools/hf_tok.py decode <model> %s\n",
                args.output_tok);
     }
 

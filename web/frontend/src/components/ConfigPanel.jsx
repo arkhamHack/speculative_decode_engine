@@ -74,11 +74,49 @@ function ModeSelect({ value, onChange }) {
   )
 }
 
+function WeightSourcePicker({ production, onChange }) {
+  return (
+    <div className="space-y-2">
+      <div className="label">Weight source</div>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={() => onChange(false)}
+          className={`rounded-lg border px-3 py-2.5 text-left transition-all duration-150 ${
+            !production
+              ? 'border-blue-500 bg-blue-500/15 text-blue-300 ring-1 ring-blue-500/40'
+              : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+          }`}
+        >
+          <div className="text-xs font-semibold text-zinc-200">Dummy bench</div>
+          <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+            Random weights + synthetic prompt (seed / prompt length)
+          </div>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange(true)}
+          className={`rounded-lg border px-3 py-2.5 text-left transition-all duration-150 ${
+            production
+              ? 'border-emerald-500 bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/40'
+              : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+          }`}
+        >
+          <div className="text-xs font-semibold text-zinc-200">Production</div>
+          <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">
+            SDEC <code className="text-zinc-400">.bin</code> + HF tokenizer + prompt
+          </div>
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function ConfigPanel({ config, onChange, onRun, onCompare, onSweep, loading }) {
   const set = (key) => (val) => onChange({ ...config, [key]: val })
 
   return (
-    <aside className="flex flex-col gap-4 w-72 shrink-0">
+    <aside className="flex flex-col gap-4 w-72 shrink-0 min-h-0 overflow-y-auto pr-1 pb-2">
       {/* Header */}
       <div className="flex items-center gap-2 pb-1">
         <Settings2 size={18} className="text-blue-400" />
@@ -106,18 +144,83 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
         <Slider label="Draft tokens k" value={config.k} min={1} max={8} onChange={set('k')}
           format={v => `k = ${v}`} />
         <Slider label="Max tokens" value={config.maxTokens} min={8} max={128} step={8} onChange={set('maxTokens')} />
-        <Slider label="Prompt length" value={config.promptLen} min={1} max={16} onChange={set('promptLen')} />
+        {!config.production && (
+          <>
+            <Slider label="Prompt length" value={config.promptLen} min={1} max={16} onChange={set('promptLen')} />
+            <div className="space-y-2">
+              <div className="label">Seed</div>
+              <input
+                type="number"
+                value={config.seed}
+                min={0}
+                onChange={e => set('seed')(Number(e.target.value))}
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+          </>
+        )}
+        {config.production && (
+          <p className="text-xs text-zinc-500">
+            Dummy <span className="text-zinc-400">prompt length</span> and <span className="text-zinc-400">seed</span> are
+            not used — the text prompt below is encoded with the tokenizer.
+          </p>
+        )}
+      </div>
 
-        <div className="space-y-2">
-          <div className="label">Seed</div>
-          <input
-            type="number"
-            value={config.seed}
-            min={0}
-            onChange={e => set('seed')(Number(e.target.value))}
-            className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
-          />
-        </div>
+      {/* Production: real SDEC weights + prompt */}
+      <div className="card space-y-4">
+        <WeightSourcePicker
+          production={config.production}
+          onChange={(v) => set('production')(v)}
+        />
+        <p className="text-[11px] text-zinc-500 leading-relaxed border-l-2 border-zinc-700 pl-3">
+          Export <code className="text-zinc-400">.bin</code> from Hugging Face checkpoints with{' '}
+          <code className="text-zinc-400">python tools/export_model.py &lt;model&gt; -o path.bin</code>{' '}
+          (see script header for supported architectures).
+        </p>
+        {config.production && (
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <div className="label">Draft weights (.bin)</div>
+              <input
+                type="text"
+                value={config.draftPath}
+                onChange={e => set('draftPath')(e.target.value)}
+                placeholder="weights/draft.bin or absolute path"
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="label">Target weights (.bin)</div>
+              <input
+                type="text"
+                value={config.targetPath}
+                onChange={e => set('targetPath')(e.target.value)}
+                placeholder="weights/target.bin"
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="label">Tokenizer (HF model id)</div>
+              <input
+                type="text"
+                value={config.tokenizerModel}
+                onChange={e => set('tokenizerModel')(e.target.value)}
+                placeholder="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="label">Prompt text</div>
+              <textarea
+                value={config.promptText}
+                onChange={e => set('promptText')(e.target.value)}
+                rows={4}
+                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-blue-500 resize-y min-h-[88px]"
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Actions */}

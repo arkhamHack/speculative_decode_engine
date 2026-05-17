@@ -1,6 +1,9 @@
 """
-tools/tokenize.py
+tools/hf_tok.py
 Convert text ↔ token ID binary files for use with spec_decode.exe.
+
+(Renamed from tokenize.py — that name shadowed Python's stdlib "tokenize" and broke
+transformers and other packages.)
 
 Binary (.tok) format
 --------------------
@@ -18,7 +21,7 @@ inspect -- print token ids and their string representations
 Usage examples
 --------------
     # Tokenize a prompt
-    python tools/tokenize.py encode TinyLlama/TinyLlama-1.1B-Chat-v1.0 \\
+    python tools/hf_tok.py encode TinyLlama/TinyLlama-1.1B-Chat-v1.0 \\
            "Once upon a time" prompt.tok
 
     # Run benchmark
@@ -26,10 +29,10 @@ Usage examples
                     --prompt-tok=prompt.tok --output-tok=output.tok
 
     # Decode the generated token ids back to text
-    python tools/tokenize.py decode TinyLlama/TinyLlama-1.1B-Chat-v1.0 output.tok
+    python tools/hf_tok.py decode TinyLlama/TinyLlama-1.1B-Chat-v1.0 output.tok
 
     # Inspect what tokens a .tok file contains
-    python tools/tokenize.py inspect TinyLlama/TinyLlama-1.1B-Chat-v1.0 prompt.tok
+    python tools/hf_tok.py inspect TinyLlama/TinyLlama-1.1B-Chat-v1.0 prompt.tok
 """
 
 import struct
@@ -104,8 +107,8 @@ def main():
 
     # encode
     p_enc = sub.add_parser("encode", help="text → .tok binary file")
-    p_enc.add_argument("model",  help="HuggingFace model name or local path")
-    p_enc.add_argument("text",   help="Text to tokenize")
+    p_enc.add_argument("model", help="HuggingFace model name or local path")
+    p_enc.add_argument("text", help="Text to tokenize")
     p_enc.add_argument("output", help="Output .tok file")
 
     # decode

@@ -4,10 +4,10 @@ Export a HuggingFace LLaMA-family model to SDEC binary format.
 
 Architecture requirements
 -------------------------
-The SDEC runtime implements a simplified LLaMA-style transformer:
+The SDEC CUDA runtime implements a LLaMA-style transformer:
   - RMSNorm (not LayerNorm)
   - SwiGLU MLP (gate_proj * silu + up_proj, then down_proj)
-  - Multi-head self-attention WITHOUT rotary position embeddings (RoPE)
+  - Multi-head self-attention with RoPE on Q/K (Llama/HF layout); KV cache stores rotated K.
   - Standard multi-head attention (n_kv_heads == n_heads or GQA is expanded)
 
 Supported HuggingFace model families
@@ -18,24 +18,18 @@ Partially: Models with GQA (SmolLM2, Mistral) — KV heads are expanded
            to full rank automatically.
 Not supported: GPT-2 (LayerNorm, GELU, combined QKV), BERT, T5, Phi, Gemma.
 
-Important note on RoPE
-----------------------
-Rotary position embeddings are NOT implemented in the C++/CUDA runtime.
-Loaded weights will run correctly for evaluating the speculative-decoding
-engine mechanics (throughput, acceptance rate, cache behaviour), but the
-generated text will not be semantically meaningful because the model loses
-positional information.  Adding RoPE is a straightforward TODO.
+RoPE note
+---------
+Base frequency ``rope_theta`` is stored in the SDEC header (format v2).
+Llama 3+ ``rope_scaling`` (YaRN / NTK) is not applied in CUDA — moderate-length
+greedy decoding still tracks HF closely when ``rope_theta`` matches the checkpoint.
 
 SDEC binary format
 ------------------
-Header  (7 * uint32):
-  magic[4]    "SDEC"
-  version     1
-  n_layers
-  d_model
-  n_heads
-  d_ff
-  vocab_size
+Header after magic ``SDEC``:
+  uint32 version       (2 — current exporter)
+  uint32 n_layers, d_model, n_heads, d_ff, vocab_size
+  float32 rope_theta   (v2 only; v1 loaders default rope_theta to 10000)
 
 Tensors (fixed order, each preceded by uint32 element count):
   token_embedding  [vocab_size * d_model]  float16
@@ -54,15 +48,14 @@ Tensors (fixed order, each preceded by uint32 element count):
 
 Usage
 -----
-    python tools/export_model.py TinyLlama/TinyLlama-1.1B-Chat-v1.0 \\
-           --draft --output draft.bin
+    # Smaller model → draft weights (fewer layers / faster propose step)
+    python tools/export_model.py org/smaller-llama-model -o weights/draft.bin
 
-    python tools/export_model.py meta-llama/Llama-3.2-1B \\
-           --output target.bin
+    # Larger model → target weights (verification model)
+    python tools/export_model.py org/larger-llama-model -o weights/target.bin
 
-    # Then run the benchmark:
-    spec_decode.exe --draft=draft.bin --target=target.bin \\
-                    --prompt-tok=prompt.tok --max-tokens=64
+    # Requires: pip install transformers torch
+    # Then run the CUDA benchmark or enable Production mode in the web UI.
 """
 
 import struct
@@ -124,6 +117,7 @@ def export_llama(model_name: str, output_path: str) -> None:
     n_kv_heads = getattr(cfg, "num_key_value_heads", n_heads)
     d_ff       = cfg.intermediate_size
     vocab_size = cfg.vocab_size
+    rope_theta = float(getattr(cfg, "rope_theta", 10000.0))
 
     if n_kv_heads != n_heads:
         print(f"  GQA detected (n_heads={n_heads}, n_kv_heads={n_kv_heads})  "
@@ -133,7 +127,7 @@ def export_llama(model_name: str, output_path: str) -> None:
     params_m = (vocab_size * d_model * 2 +                         # embed + lm_head
                 n_layers * (4 * d_model * d_model + 3 * d_model * d_ff)) / 1e6
     print(f"Config: layers={n_layers}  d={d_model}  heads={n_heads}  "
-          f"d_ff={d_ff}  vocab={vocab_size}")
+          f"d_ff={d_ff}  vocab={vocab_size}  rope_theta={rope_theta}")
     print(f"Estimated float16 size: {params_m * 2:.0f} MB")
 
     print(f"\nLoading weights (this may take a while)...")
@@ -149,9 +143,20 @@ def export_llama(model_name: str, output_path: str) -> None:
 
     print(f"\nWriting to {output_path} ...")
     with open(output_path, "wb") as f:
-        # --- Header ---
+        # --- Header SDEC v2 (rope_theta for CUDA RoPE) ---
         f.write(b"SDEC")
-        f.write(struct.pack("IIIIII", 1, n_layers, d_model, n_heads, d_ff, vocab_size))
+        f.write(
+            struct.pack(
+                "IIIIII",
+                2,
+                n_layers,
+                d_model,
+                n_heads,
+                d_ff,
+                vocab_size,
+            )
+        )
+        f.write(struct.pack("<f", rope_theta))
 
         # --- Global tensors ---
         print("  Global tensors:")

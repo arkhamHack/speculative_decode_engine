@@ -1,9 +1,22 @@
 #include "kernels.h"
 #include "utils.h"
 #include <cstdio>
+#include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
 
 namespace cg = cooperative_groups;
+
+// Ampere+ may require raising the dynamic shared-memory cap when scratch > 48 KiB.
+template<typename K>
+static inline void cuda_configure_kernel_dynamic_smem(K kernel, size_t smem_bytes) {
+    constexpr size_t kDefaultDynSmemCap = 49152;
+    if (smem_bytes > kDefaultDynSmemCap) {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            (void*)kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)smem_bytes));
+    }
+}
 
 // ============================================================================
 // Shared memory layout (dynamic — sized at launch via compute_smem_bytes())
@@ -69,6 +82,7 @@ void multikernel_baseline(const ModelWeights& target_model,
 
     // Dynamic smem and logits buffer sized for the target model
     size_t smem_bytes = compute_smem_bytes(target_model.cfg);
+    cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, smem_bytes);
     float* g_logits;
     CUDA_CHECK(cudaMalloc(&g_logits,
                           (size_t)target_model.cfg.vocab_size * sizeof(float)));
@@ -136,6 +150,10 @@ void multikernel_speculative(const ModelWeights& draft_model,
     // Each model gets its own smem budget and logits buffer
     size_t draft_smem  = compute_smem_bytes(draft_model.cfg);
     size_t target_smem = compute_smem_bytes(target_model.cfg);
+    size_t max_decode_smem =
+        draft_smem > target_smem ? draft_smem : target_smem;
+    cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
+                                       max_decode_smem);
 
     float* g_logits_draft;
     float* g_logits_target;
@@ -296,10 +314,14 @@ void multikernel_speculative(const ModelWeights& draft_model,
 
 // ---- Megakernel: Baseline ----
 
+// ModelWeights/KVCache are large (e.g. layers[MAX_LAYERS]); passing them by value
+// overflows the 4 KiB CUDA kernel parameter limit. Pass device pointers instead.
 __global__ void megakernel_baseline_kernel(
-        ModelWeights target_model, KVCache target_kv,
+        const ModelWeights* p_target_model, KVCache* p_target_kv,
         const int* prompt, int prompt_len, int max_new_tokens,
         float* g_logits, GenerationResult* result) {
+    const ModelWeights& target_model = *p_target_model;
+    KVCache&            target_kv    = *p_target_kv;
     extern __shared__ float shared[];
     int d = target_model.cfg.d_model;
     float* hidden = shared;       // [d_model]
@@ -360,12 +382,16 @@ __global__ void megakernel_baseline_kernel(
 constexpr int MAX_MEGA_K = 16;
 
 __global__ void megakernel_speculative_kernel(
-        ModelWeights draft_model, ModelWeights target_model,
-        KVCache draft_kv, KVCache target_kv,
+        const ModelWeights* p_draft_model, const ModelWeights* p_target_model,
+        KVCache* p_draft_kv, KVCache* p_target_kv,
         const int* prompt, int prompt_len,
         int max_new_tokens, int spec_k,
         float* g_logits,   // vocab_size floats (sized for larger model)
         GenerationResult* result) {
+    const ModelWeights& draft_model  = *p_draft_model;
+    const ModelWeights& target_model = *p_target_model;
+    KVCache&            draft_kv     = *p_draft_kv;
+    KVCache&            target_kv    = *p_target_kv;
     extern __shared__ float shared[];
     // Use the larger model's d_model for the hidden state layout.
     // Both models share the same smem; the larger model's scratch
@@ -543,10 +569,24 @@ void megakernel_baseline(const ModelWeights& target_model,
 
     kv_cache_reset(target_kv);
     size_t smem_bytes = compute_smem_bytes(target_model.cfg);
+    cuda_configure_kernel_dynamic_smem(megakernel_baseline_kernel, smem_bytes);
+
+    ModelWeights* d_target_model;
+    KVCache*      d_target_kv;
+    CUDA_CHECK(cudaMalloc(&d_target_model, sizeof(ModelWeights)));
+    CUDA_CHECK(cudaMalloc(&d_target_kv, sizeof(KVCache)));
+    CUDA_CHECK(cudaMemcpy(d_target_model, &target_model, sizeof(ModelWeights),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_target_kv, &target_kv, sizeof(KVCache),
+                          cudaMemcpyHostToDevice));
+
     megakernel_baseline_kernel<<<1, BLOCK_THREADS, smem_bytes>>>(
-        target_model, target_kv, prompt, prompt_len,
+        d_target_model, d_target_kv, prompt, prompt_len,
         params.max_new_tokens, g_logits, d_result);
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_target_model);
+    cudaFree(d_target_kv);
     cudaFree(g_logits);
 }
 
@@ -566,13 +606,38 @@ void megakernel_speculative(const ModelWeights& draft_model,
 
     // Megakernel uses the TARGET model's smem budget (it's always >= draft's)
     size_t smem_bytes = compute_smem_bytes(target_model.cfg);
+    cuda_configure_kernel_dynamic_smem(megakernel_speculative_kernel,
+                                       smem_bytes);
 
     kv_cache_reset(draft_kv);
     kv_cache_reset(target_kv);
+
+    ModelWeights* d_draft_model;
+    ModelWeights* d_target_model;
+    KVCache*      d_draft_kv;
+    KVCache*      d_target_kv;
+    CUDA_CHECK(cudaMalloc(&d_draft_model, sizeof(ModelWeights)));
+    CUDA_CHECK(cudaMalloc(&d_target_model, sizeof(ModelWeights)));
+    CUDA_CHECK(cudaMalloc(&d_draft_kv, sizeof(KVCache)));
+    CUDA_CHECK(cudaMalloc(&d_target_kv, sizeof(KVCache)));
+    CUDA_CHECK(cudaMemcpy(d_draft_model, &draft_model, sizeof(ModelWeights),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_target_model, &target_model, sizeof(ModelWeights),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_draft_kv, &draft_kv, sizeof(KVCache),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_target_kv, &target_kv, sizeof(KVCache),
+                          cudaMemcpyHostToDevice));
+
     megakernel_speculative_kernel<<<1, BLOCK_THREADS, smem_bytes>>>(
-        draft_model, target_model, draft_kv, target_kv,
+        d_draft_model, d_target_model, d_draft_kv, d_target_kv,
         prompt, prompt_len, params.max_new_tokens, params.spec_k,
         g_logits, d_result);
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_draft_model);
+    cudaFree(d_target_model);
+    cudaFree(d_draft_kv);
+    cudaFree(d_target_kv);
     cudaFree(g_logits);
 }

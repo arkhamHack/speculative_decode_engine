@@ -6,9 +6,9 @@
 // Tokenizer
 //
 // The C++/CUDA runtime uses a minimal binary-file-based tokenizer:
-//   - Encoding (text → token IDs) is handled by tools/tokenize.py using the
+//   - Encoding (text → token IDs) is handled by tools/hf_tok.py using the
 //     original HuggingFace tokenizer, which writes a .tok binary file.
-//   - Decoding (token IDs → text) is similarly handled by tools/tokenize.py.
+//   - Decoding (token IDs → text) is similarly handled by tools/hf_tok.py.
 //
 // Prompt binary format (.tok file):
 //   [n_tokens : uint32]
@@ -18,7 +18,7 @@
 // ============================================================================
 
 struct Tokenizer {
-    // Load token IDs from a .tok binary file produced by tools/tokenize.py.
+    // Load token IDs from a .tok binary file produced by tools/hf_tok.py.
     // Returns true on success.
     bool load(const char* path);
 

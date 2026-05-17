@@ -117,12 +117,14 @@ void model_init_random(ModelWeights& model, unsigned seed) {
 //
 // File format (little-endian):
 //   [4 bytes]  magic  "SDEC"
-//   [4 bytes]  version  (must be 1)
+//   [4 bytes]  version  (1 or 2)
 //   [4 bytes]  n_layers
 //   [4 bytes]  d_model
 //   [4 bytes]  n_heads
 //   [4 bytes]  d_ff
 //   [4 bytes]  vocab_size
+//   If version >= 2:
+//   [4 bytes]  rope_theta  (float32, Llama rotary base)
 //
 // Tensors in this fixed order (each preceded by uint32 element count):
 //   token_embedding  [vocab_size * d_model]
@@ -160,14 +162,30 @@ bool model_load_weights(ModelWeights& model, const char* path,
 
     // --- Read header ---
     uint32_t version, n_layers, d_model, n_heads, d_ff, vocab_size;
-    if (fread(&version,    4, 1, f) != 1 || version != 1u ||
-        fread(&n_layers,   4, 1, f) != 1 ||
+    if (fread(&version, 4, 1, f) != 1) {
+        fprintf(stderr, "[model_load] Truncated header in '%s'\n", path);
+        fclose(f); return false;
+    }
+    if (version != 1u && version != 2u) {
+        fprintf(stderr, "[model_load] Unsupported SDEC version %u (expected 1 or 2)\n",
+                version);
+        fclose(f); return false;
+    }
+    if (fread(&n_layers,   4, 1, f) != 1 ||
         fread(&d_model,    4, 1, f) != 1 ||
         fread(&n_heads,    4, 1, f) != 1 ||
         fread(&d_ff,       4, 1, f) != 1 ||
         fread(&vocab_size, 4, 1, f) != 1) {
         fprintf(stderr, "[model_load] Truncated header in '%s'\n", path);
         fclose(f); return false;
+    }
+
+    float rope_theta = 10000.f;
+    if (version >= 2u) {
+        if (fread(&rope_theta, sizeof(float), 1, f) != 1) {
+            fprintf(stderr, "[model_load] Truncated rope_theta in '%s'\n", path);
+            fclose(f); return false;
+        }
     }
 
     if ((int)n_layers > MAX_LAYERS) {
@@ -188,6 +206,7 @@ bool model_load_weights(ModelWeights& model, const char* path,
     cfg.n_heads    = (int)n_heads;
     cfg.d_ff       = (int)d_ff;
     cfg.vocab_size = (int)vocab_size;
+    cfg.rope_theta = rope_theta;
     if (cfg_out) *cfg_out = cfg;
 
     model_alloc(model, cfg);
@@ -248,9 +267,54 @@ bool model_load_weights(ModelWeights& model, const char* path,
         return false;
     }
 
-    fprintf(stderr, "[model_load] Loaded '%s'  layers=%d d=%d heads=%d d_ff=%d vocab=%d\n",
-            path, cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.vocab_size);
+    fprintf(stderr,
+            "[model_load] Loaded '%s'  layers=%d d=%d heads=%d d_ff=%d vocab=%d rope_theta=%g "
+            "(SDEC v%u)\n",
+            path, cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.vocab_size,
+            cfg.rope_theta, version);
     return true;
+}
+
+// ============================================================================
+// Device: rotary positional embeddings (Llama / GPT-NeoX pair layout)
+//
+// inv_freq[j] = theta^(-2*j/d_head_per), angle = pos * inv_freq
+// Pair (x_{2j}, x_{2j+1}) <- rotation by (cos, sin).
+// Applied to Q and K before attention; KV cache stores rotated K (HF-compatible).
+// ============================================================================
+
+__device__ void rope_apply_heads_qk_inplace(float* q, float* k, int nh, int dph,
+                                            int pos_m, float rope_theta) {
+    int tid        = threadIdx.x;
+    int nthreads   = blockDim.x;
+    const int pairs = dph / 2;
+    if (pairs < 1)
+        return;
+
+    float theta       = rope_theta > 1e-6f ? rope_theta : 10000.f;
+    const float log_theta = logf(theta);
+
+    for (int h = 0; h < nh; h++) {
+        int base = h * dph;
+        for (int j = tid; j < pairs; j += nthreads) {
+            float inv_freq = expf(-log_theta * (float)(2 * j) / (float)dph);
+            float angle    = (float)pos_m * inv_freq;
+            float c        = cosf(angle);
+            float s        = sinf(angle);
+
+            int i0 = base + 2 * j;
+            int i1 = base + 2 * j + 1;
+
+            float q0 = q[i0], q1 = q[i1];
+            q[i0]    = q0 * c - q1 * s;
+            q[i1]    = q0 * s + q1 * c;
+
+            float k0 = k[i0], k1 = k[i1];
+            k[i0]    = k0 * c - k1 * s;
+            k[i1]    = k0 * s + k1 * c;
+        }
+        __syncthreads();
+    }
 }
 
 // ============================================================================
@@ -278,18 +342,19 @@ __device__ void model_embed(const ModelWeights& model, int token_id,
 //   2.  Q[d] = normed @ Wq         (all heads concatenated)
 //       K[d] = normed @ Wk
 //       V[d] = normed @ Wv
-//   3.  Append K, V to paged KV cache (stored interleaved per slot: K[d], V[d])
-//   4.  For head h in [0, n_heads):
+//   3.  Apply RoPE to Q and K at absolute position current_seq_len (Llama/HF layout).
+//   4.  Append rotated K and V to paged KV cache (per slot: K[d], V[d])
+//   5.  For head h in [0, n_heads):
 //         a. scores[p] = (Q[h*dph:(h+1)*dph] · K_p[h*dph:(h+1)*dph]) / sqrt(dph)
 //            for each cached position p
 //         b. softmax(scores)
 //         c. attn_out[h*dph:(h+1)*dph] = Σ_p scores[p] * V_p[h*dph:(h+1)*dph]
-//   5.  hidden += attn_out @ Wo          (residual)
-//   6.  RMSNorm(hidden) -> normed
-//   7.  SwiGLU: gate = normed @ W_gate
+//   6.  hidden += attn_out @ Wo          (residual)
+//   7.  RMSNorm(hidden) -> normed
+//   8.  SwiGLU: gate = normed @ W_gate
 //               up   = normed @ W_up
 //               mlp_out = silu(gate) * up  @ W_down
-//   8.  hidden += mlp_out                (residual)
+//   9.  hidden += mlp_out                (residual)
 //
 // Shared memory scratch layout (smem = shared + d):
 //   normed   [d]              RMSNorm output, also MLP scratch
@@ -333,16 +398,19 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
     // 2. Full Q[d], K[d], V[d] via matrix-vector multiply
     device_matvec(normed, lw.Wq, q_all, d, d);
 
-    // K: compute into kv_temp, then copy to attn_out (as temporary K storage)
-    device_matvec(normed, lw.Wk, kv_temp, d, d);
-    for (int i = tid; i < d; i += blockDim.x)
-        attn_out[i] = kv_temp[i];    // save K in attn_out temporarily
+    // K directly into attn_out (temporary storage before KV append)
+    device_matvec(normed, lw.Wk, attn_out, d, d);
     __syncthreads();
 
-    // V: compute into kv_temp
-    device_matvec(normed, lw.Wv, kv_temp, d, d);
+    // 3. Rotary embeddings on Q and K (absolute position = current_seq_len)
+    rope_apply_heads_qk_inplace(q_all, attn_out, nh, dph, current_seq_len,
+                                model.cfg.rope_theta);
 
-    // 3. Append K (in attn_out) and V (in kv_temp) to paged KV cache.
+    // V: compute into kv_temp (no RoPE on V)
+    device_matvec(normed, lw.Wv, kv_temp, d, d);
+    __syncthreads();
+
+    // 4. Append rotated K (attn_out) and V (kv_temp) to paged KV cache.
     //    kv.d_head = d_model: the cache stores the full K[d] and V[d] per slot.
     kv_cache_append(kv, layer_idx, attn_out, kv_temp, current_seq_len);
 
@@ -350,14 +418,14 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
     for (int i = tid; i < d; i += blockDim.x) attn_out[i] = 0.0f;
     __syncthreads();
 
-    // 4. Multi-head attention
+    // 5. Multi-head attention
     int total_len = current_seq_len + 1;  // includes the just-appended token
     float scale   = rsqrtf((float)dph);
 
     for (int h = 0; h < nh; h++) {
         int head_off = h * dph;  // offset in K/V/Q for this head
 
-        // --- 4a. Compute attention scores (position-parallel) ---
+        // --- 5a. Compute attention scores (position-parallel) ---
         for (int p = tid; p < total_len; p += blockDim.x) {
             int lb = p / KV_BLOCK_SIZE, sl = p % KV_BLOCK_SIZE;
             int pb = kv.layers[layer_idx].block_table[lb];
@@ -372,10 +440,10 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
         }
         __syncthreads();
 
-        // --- 4b. Softmax over scores[0..total_len-1] ---
+        // --- 5b. Softmax over scores[0..total_len-1] ---
         block_softmax_inplace(scores, total_len, scratch);
 
-        // --- 4c. Weighted sum of V (element-parallel within this head) ---
+        // --- 5c. Weighted sum of V (element-parallel within this head) ---
         for (int e = tid; e < dph; e += blockDim.x) {
             int global_e = head_off + e;
             float acc = 0.0f;
@@ -392,7 +460,7 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
         __syncthreads();
     }
 
-    // 5. Output projection: attn_out[d] @ Wo[d,d] -> kv_temp[d]
+    // 6. Output projection: attn_out[d] @ Wo[d,d] -> kv_temp[d]
     device_matvec(attn_out, lw.Wo, kv_temp, d, d);
 
     // Residual

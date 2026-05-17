@@ -15,6 +15,11 @@ const DEFAULT_CONFIG = {
   maxTokens: 32,
   promptLen: 4,
   seed:      42,
+  production: false,
+  draftPath: '',
+  targetPath: '',
+  tokenizerModel: '',
+  promptText: 'Once upon a time',
 }
 
 async function apiFetch(path, body) {
@@ -105,6 +110,15 @@ export default function App() {
     k:           config.k,
     seed:        config.seed,
     prompt_len:  config.promptLen,
+    ...(config.production
+      ? {
+          production: true,
+          draft_path: config.draftPath,
+          target_path: config.targetPath,
+          tokenizer_model: config.tokenizerModel,
+          prompt_text: config.promptText,
+        }
+      : { production: false }),
   })
 
   const handleRun = async () => {
@@ -144,6 +158,15 @@ export default function App() {
         k_max:      config.k,
         seed:       config.seed,
         prompt_len: config.promptLen,
+        ...(config.production
+          ? {
+              production: true,
+              draft_path: config.draftPath,
+              target_path: config.targetPath,
+              tokenizer_model: config.tokenizerModel,
+              prompt_text: config.promptText,
+            }
+          : { production: false }),
       })
       setSweepData(r)
     } catch (e) {
@@ -177,7 +200,7 @@ export default function App() {
       </header>
 
       {/* Main layout */}
-      <div className="flex flex-1 gap-6 p-6 overflow-hidden">
+      <div className="flex flex-1 gap-6 p-6 min-h-0 overflow-hidden">
         {/* Left: config */}
         <ConfigPanel
           config={config}
@@ -214,15 +237,30 @@ export default function App() {
                 {/* Info box */}
                 <div className="card space-y-2 text-xs text-zinc-500">
                   <div className="label">About</div>
-                  <p>
-                    The <span className="text-zinc-300">draft model</span> (2L, d=128) proposes k tokens.
-                    The <span className="text-zinc-300">target model</span> (4L, d=256) verifies them in one pass.
-                    Matching tokens are kept; the first mismatch triggers a rollback.
-                  </p>
-                  <p>
-                    Expected speedup: <span className="text-zinc-300 font-mono">(1-α^(k+1))/((1-α)(ck+1))</span>
-                    &nbsp;from Leviathan et al.
-                  </p>
+                  {config.production ? (
+                    <p>
+                      <span className="text-zinc-300">Production</span> uses your SDEC{' '}
+                      <code className="text-zinc-400">draft.bin</code> /{' '}
+                      <code className="text-zinc-400">target.bin</code> and Hugging Face tokenizer to
+                      encode the prompt and decode generated token IDs to text. SDEC{' '}
+                      <span className="text-zinc-400">v2</span> stores{' '}
+                      <code className="text-zinc-400">rope_theta</code> for Llama-style RoPE in CUDA.
+                      Very long contexts may still differ slightly from HF if the checkpoint uses{' '}
+                      <code className="text-zinc-400">rope_scaling</code> (not replicated here).
+                    </p>
+                  ) : (
+                    <>
+                      <p>
+                        The <span className="text-zinc-300">draft model</span> (2L, d=128) proposes k tokens.
+                        The <span className="text-zinc-300">target model</span> (4L, d=256) verifies them in one pass.
+                        Matching tokens are kept; the first mismatch triggers a rollback.
+                      </p>
+                      <p>
+                        Expected speedup: <span className="text-zinc-300 font-mono">(1-α^(k+1))/((1-α)(ck+1))</span>
+                        &nbsp;from Leviathan et al.
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             </div>

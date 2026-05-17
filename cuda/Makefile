@@ -5,7 +5,7 @@ NVCC_FLAGS := -std=c++17 --use_fast_math --expt-relaxed-constexpr -Iinclude
 ARCH       ?= -gencode arch=compute_70,code=sm_70 \
               -gencode arch=compute_80,code=sm_80
 
-CORE_SRC := src/utils.cu src/kv_cache.cu src/model.cu src/kernels.cu
+CORE_SRC := src/utils.cu src/device_inference_bundle.cu src/tokenizer.cu
 
 # ---- Standalone executable ----
 EXE := spec_decode

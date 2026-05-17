@@ -91,6 +91,7 @@ export default function ResultsPanel({ result, loading }) {
   }
 
   const isMock = result.device?.includes('mock')
+  const isProd = result.production
 
   return (
     <div className="flex-1 space-y-4 overflow-y-auto">
@@ -100,7 +101,10 @@ export default function ResultsPanel({ result, loading }) {
           <Monitor size={14} />
           <span className="font-mono">{result.device || 'Unknown device'}</span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          {isProd && (
+            <span className="badge-mock border-emerald-500/30 text-emerald-400 bg-emerald-500/10">production</span>
+          )}
           {isMock && <span className="badge-mock">mock data</span>}
           {result.match != null && (
             result.match
@@ -172,6 +176,39 @@ export default function ResultsPanel({ result, loading }) {
           )
         })}
       </div>
+
+      {/* Decoded text (production) */}
+      {(result.production || result.decode_error) ? (
+        <div className="card space-y-3">
+          <div className="label">Decoded text (HF tokenizer)</div>
+          {result.prompt_preview ? (
+            <div className="text-xs text-zinc-500 border-l-2 border-zinc-600 pl-2">
+              <span className="text-zinc-500">Prompt · </span>
+              <span className="text-zinc-300 whitespace-pre-wrap">{result.prompt_preview}</span>
+            </div>
+          ) : null}
+          {result.decode_error && (
+            <div className="text-xs text-amber-400">Decode error: {result.decode_error}</div>
+          )}
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">Baseline continuation</div>
+            <p className="text-sm text-zinc-200 whitespace-pre-wrap leading-relaxed bg-zinc-800/60 rounded-lg p-3 border border-zinc-700/80">
+              {result.baseline_text || '—'}
+            </p>
+          </div>
+          <div className="space-y-1">
+            <div className="text-xs text-zinc-500">Speculative continuation</div>
+            <p className="text-sm text-zinc-200 whitespace-pre-wrap leading-relaxed bg-blue-500/5 rounded-lg p-3 border border-blue-500/25">
+              {result.spec_text || '—'}
+            </p>
+          </div>
+          <p className="text-xs text-zinc-600">
+            Greedy decoding with Llama-style RoPE on Q/K (SDEC v2{' '}
+            <code className="text-zinc-500">rope_theta</code>). HF may still differ slightly on very long contexts if{' '}
+            <code className="text-zinc-500">rope_scaling</code> is enabled there.
+          </p>
+        </div>
+      ) : null}
 
       {/* Token output */}
       <div className="card space-y-3">

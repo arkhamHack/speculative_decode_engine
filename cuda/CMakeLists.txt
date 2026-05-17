@@ -19,15 +19,14 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 # Source files shared by all targets (everything except main.cu and binding.cu)
 set(CORE_SOURCES
     src/utils.cu
-    src/kv_cache.cu
-    src/model.cu
-    src/kernels.cu
+    src/device_inference_bundle.cu
     src/tokenizer.cu
 )
 
 # ==========================================================================
 # Target 1: standalone executable
 # ==========================================================================
+
 add_executable(spec_decode
     src/main.cu
     ${CORE_SOURCES}
