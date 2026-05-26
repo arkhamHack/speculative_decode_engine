@@ -14,6 +14,7 @@ import time
 import random
 from pathlib import Path
 from typing import Optional
+from transformers import AutoTokenizer
 
 # Locate the exe relative to this file
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,12 +59,42 @@ def _write_tok_file(path: Path, ids: list[int]) -> None:
             f.write(struct.pack("I", int(i) & 0xFFFFFFFF))
 
 
-def encode_prompt_tok(tokenizer_model: str, text: str, out_path: Path) -> None:
-    from transformers import AutoTokenizer
+def encode_prompt_tok(tokenizer_model: str, text: str, out_path: Path,
+                      *, use_chat_template: bool = True) -> tuple[list[int], int]:
+    """Encode prompt to token file.  Returns (token_ids, eos_token_id)."""
 
     tok = AutoTokenizer.from_pretrained(tokenizer_model)
-    ids = tok.encode(text, add_special_tokens=True)
+
+    ids: list[int]
+    has_role_tag = any(t in text for t in ("<|im_start|>", "[INST]", "<s>", "### Human"))
+    use_template = (use_chat_template
+                    and getattr(tok, "chat_template", None)
+                    and not has_role_tag)
+
+    if use_template:
+        try:
+            ids = tok.apply_chat_template(
+                [{"role": "user", "content": text}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            if not isinstance(ids, list):
+                try:
+                    ids = list(ids["input_ids"])
+                except (TypeError, KeyError):
+                    ids = list(ids)
+        except Exception:
+            ids = tok.encode(text, add_special_tokens=True)
+    else:
+        ids = tok.encode(text, add_special_tokens=True)
+
     _write_tok_file(out_path, ids)
+
+    eos_id: int = getattr(tok, "eos_token_id", None) or -1
+    # Some tokenizers expose a list; take the first entry
+    if isinstance(eos_id, list):
+        eos_id = eos_id[0] if eos_id else -1
+    return ids, int(eos_id)
 
 
 def decode_token_ids_to_text(tokenizer_model: str, ids: list[int]) -> str:
@@ -286,6 +317,15 @@ def run_benchmark(
     target_path: Optional[str] = None,
     tokenizer_model: Optional[str] = None,
     prompt_text: Optional[str] = None,
+    use_chat_template: bool = True,
+    # Stochastic speculative decoding (Leviathan et al. exact algorithm)
+    stochastic: bool = False,
+    draft_temp: float = 1.0,
+    adaptive_draft_temp: bool = False,
+    adapt_accept: float = 0.5,
+    adapt_gain: float = 0.055,
+    adapt_ewma: float = 0.25,
+    spec_seed: int = 12345,
 ) -> dict:
     exe = find_exe()
     if exe is None:
@@ -317,8 +357,12 @@ def run_benchmark(
             p_out = Path(out_tok_path)
             tmp_rm.append(p_out)
 
+            eos_token_id = -1
             try:
-                encode_prompt_tok(tokenizer_model, prompt_text, p_prompt)
+                _, eos_token_id = encode_prompt_tok(
+                    tokenizer_model, prompt_text, p_prompt,
+                    use_chat_template=use_chat_template,
+                )
             except Exception as e:
                 return {"error": f"Tokenizer encode failed: {e}"}
 
@@ -332,6 +376,17 @@ def run_benchmark(
                 f"--max-tokens={max_tokens}",
                 f"--k={k}",
             ]
+            if eos_token_id >= 0:
+                cmd.append(f"--eos-token={eos_token_id}")
+            if stochastic:
+                cmd.append("--stochastic-spec")
+                cmd.append(f"--draft-temp={draft_temp:.4f}")
+                cmd.append(f"--spec-seed={spec_seed}")
+                if adaptive_draft_temp:
+                    cmd.append("--adaptive-draft-temp")
+                    cmd.append(f"--adapt-accept={adapt_accept:.4f}")
+                    cmd.append(f"--adapt-gain={adapt_gain:.4f}")
+                    cmd.append(f"--adapt-ewma={adapt_ewma:.4f}")
             timeout_sec = 600
         else:
             cmd = [
@@ -342,6 +397,15 @@ def run_benchmark(
                 f"--seed={seed}",
                 f"--prompt-len={prompt_len}",
             ]
+            if stochastic:
+                cmd.append("--stochastic-spec")
+                cmd.append(f"--draft-temp={draft_temp:.4f}")
+                cmd.append(f"--spec-seed={spec_seed}")
+                if adaptive_draft_temp:
+                    cmd.append("--adaptive-draft-temp")
+                    cmd.append(f"--adapt-accept={adapt_accept:.4f}")
+                    cmd.append(f"--adapt-gain={adapt_gain:.4f}")
+                    cmd.append(f"--adapt-ewma={adapt_ewma:.4f}")
             timeout_sec = 120
 
         proc = subprocess.run(
@@ -358,6 +422,7 @@ def run_benchmark(
 
         result = parse_output(stdout)
         result["production"] = bool(production)
+        result["stochastic"] = bool(stochastic)
         if production and prompt_text is not None:
             result["prompt_preview"] = (
                 (prompt_text[:200] + "…")

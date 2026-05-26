@@ -76,10 +76,23 @@ bool model_load_weights(ModelWeights& model, const char* path,
 __device__ void model_embed(const ModelWeights& model, int token_id,
                             float* hidden);
 
-// One transformer layer: RMSNorm -> MHA -> Residual -> RMSNorm -> SwiGLU -> Residual
-// hidden is modified in-place.
-// current_seq_len: number of tokens already in the KV cache for this sequence
-//                  (the current token is appended during this call).
+// Phase 1: Q/K/V projections + RoPE + KV cache write at position seq_pos.
+// After return, smem[d..2*d) holds Q with RoPE — required by attn_mlp_phase.
+// hidden is read-only; the KV cache gains one entry at seq_pos.
+__device__ void model_layer_kv_phase(const ModelWeights& model, int layer_idx,
+                                      const float* hidden, KVCache& kv,
+                                      int seq_pos, float* smem);
+
+// Phase 2: flash-attention over [0..seq_pos] (causal) + output proj + SwiGLU FFN.
+// Requires smem[d..2*d) = Q written by kv_phase, and K,V at seq_pos in cache.
+// hidden is updated with the attention + MLP residuals.
+__device__ void model_layer_attn_mlp_phase(const ModelWeights& model,
+                                            int layer_idx,
+                                            float* hidden, KVCache& kv,
+                                            int seq_pos, float* smem);
+
+// Full layer: kv_phase followed by attn_mlp_phase (single-block sequential path).
+// current_seq_len: tokens already in the KV cache; this token is appended here.
 __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
                                     float* hidden, KVCache& kv,
                                     int current_seq_len, float* smem);
@@ -101,3 +114,17 @@ __device__ void model_forward_logits(const ModelWeights& model, KVCache& kv,
 __device__ int model_forward(const ModelWeights& model, KVCache& kv,
                              int token_id, int current_seq_len,
                              float* hidden, float* g_logits, float* smem);
+
+// Batched forward: process B tokens through the model in one pass.
+// Reads each weight matrix ONCE for all B tokens (vs B times for sequential).
+// token_ids: [B] array in device-accessible memory.
+// g_hidden:  [B * d_model] global scratch for hidden states.
+// g_work:    [(7 * d_model + MLP_FF_TILE) * B] global scratch for intermediates.
+// g_logits:  [B * vocab_size] output logits for each position.
+// smem:      shared memory (same budget as single-token, sized for this model).
+// KV cache entries are appended at positions seq_base .. seq_base+B-1.
+__device__ void model_batch_forward_logits(
+    const ModelWeights& model, KVCache& kv,
+    const int* token_ids, int seq_base, int B,
+    float* g_hidden, float* g_work, float* g_logits,
+    float* smem);

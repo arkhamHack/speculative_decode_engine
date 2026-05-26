@@ -23,10 +23,15 @@ constexpr int BLOCK_THREADS    = 256;
 constexpr int MAX_LAYERS       = 40;
 // Column tile for SwiGLU projections (stored in repurposed buffers; never materialize full d_ff)
 constexpr int MLP_FF_TILE      = 256;
+// Max batch size for batched target verification (spec_k + 1).
+// Supports spec_k up to 8; raise and add cases to the dispatch switches in utils.h if needed.
+constexpr int MAX_VERIFY_BATCH = 9;
 
 // Default vocabulary for the built-in dummy integer tokenizer
 constexpr int DEFAULT_VOCAB_SIZE = 256;
 // Sentinel: no EOS for the dummy tokenizer (tokens 0-255 all valid)
+// Superseded by GenerationParams::eos_token (runtime value from HF tokenizer).
+// Kept only to avoid breaking any downstream references.
 constexpr int EOS_TOKEN          = -1;
 
 // Binary weight file magic ("SDEC" in little-endian uint32)
@@ -105,6 +110,8 @@ struct GenerationParams {
     int    max_new_tokens;
     int    spec_k;         // draft tokens per speculation round
     bool   use_megakernel; // false = multi-kernel loop, true = persistent megakernel
+    // EOS token id from the HF tokenizer (-1 = disabled, generation always runs to max_new_tokens)
+    int    eos_token      = -1;
     //
     // Stochastic speculative decoding (distribution-level acceptance with p,q and
     // optional adjusted rejection sampling). Supported on multi-kernel and megakernel.

@@ -41,6 +41,7 @@ class ProductionFields(BaseModel):
     target_path: Optional[str] = None
     tokenizer_model: Optional[str] = None
     prompt_text: Optional[str] = Field(None, max_length=100000)
+    use_chat_template: bool = True
 
     @model_validator(mode="after")
     def production_requires_paths(self):
@@ -61,18 +62,30 @@ class ProductionFields(BaseModel):
         return self
 
 
-class RunRequest(ProductionFields):
+class StochasticFields(BaseModel):
+    """Stochastic speculative decoding knobs (Leviathan et al. exact algorithm)."""
+
+    stochastic: bool = False
+    draft_temp: float = Field(1.0, ge=0.1, le=2.0)
+    adaptive_draft_temp: bool = False
+    adapt_accept: float = Field(0.5, ge=0.1, le=0.95)
+    adapt_gain: float = Field(0.055, ge=0.001, le=0.5)
+    adapt_ewma: float = Field(0.25, ge=0.05, le=0.95)
+    spec_seed: int = Field(12345, ge=0)
+
+
+class RunRequest(ProductionFields, StochasticFields):
     mode: str = Field("multi", pattern="^(multi|mega)$")
     spec: bool = True
-    max_tokens: int = Field(32, ge=8, le=128)
+    max_tokens: int = Field(32, ge=8, le=512)
     k: int = Field(4, ge=1, le=8)
     seed: int = Field(42, ge=0)
     prompt_len: int = Field(4, ge=1, le=16)
 
 
-class SweepRequest(ProductionFields):
+class SweepRequest(ProductionFields, StochasticFields):
     mode: str = Field("multi", pattern="^(multi|mega)$")
-    max_tokens: int = Field(32, ge=8, le=128)
+    max_tokens: int = Field(32, ge=8, le=512)
     k_max: int = Field(8, ge=2, le=8)
     seed: int = Field(42, ge=0)
     prompt_len: int = Field(4, ge=1, le=16)
@@ -91,6 +104,14 @@ def _bench_kwargs(req: RunRequest | SweepRequest) -> dict:
         "target_path": req.target_path,
         "tokenizer_model": req.tokenizer_model,
         "prompt_text": req.prompt_text,
+        "use_chat_template": req.use_chat_template,
+        "stochastic": req.stochastic,
+        "draft_temp": req.draft_temp,
+        "adaptive_draft_temp": req.adaptive_draft_temp,
+        "adapt_accept": req.adapt_accept,
+        "adapt_gain": req.adapt_gain,
+        "adapt_ewma": req.adapt_ewma,
+        "spec_seed": req.spec_seed,
     }
 
 
@@ -184,4 +205,4 @@ async def sweep(req: SweepRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="127.0.0.1", port=8001, reload=True)

@@ -67,6 +67,13 @@ function AcceptanceBar({ rate, proposed, accepted }) {
   )
 }
 
+function fmtTps(v) {
+  if (v == null || isNaN(v)) return '—'
+  if (v >= 100) return v.toFixed(0)
+  if (v >= 10)  return v.toFixed(1)
+  return v.toFixed(2)
+}
+
 export default function ResultsPanel({ result, loading }) {
   if (loading) {
     return (
@@ -109,7 +116,11 @@ export default function ResultsPanel({ result, loading }) {
           {result.match != null && (
             result.match
               ? <span className="badge-pass"><CheckCircle2 size={11} /> Output match PASS</span>
-              : <span className="badge-fail"><XCircle size={11} /> Output mismatch!</span>
+              : result.stochastic
+                ? <span className="badge-mock text-amber-400 border-amber-500/30 bg-amber-500/10">
+                    <AlertCircle size={11} /> Stochastic outputs differ
+                  </span>
+                : <span className="badge-fail"><XCircle size={11} /> Output mismatch!</span>
           )}
         </div>
       </div>
@@ -118,13 +129,13 @@ export default function ResultsPanel({ result, loading }) {
       <div className="grid grid-cols-2 gap-3">
         <MetricCard
           label="Baseline"
-          value={result.baseline_tok_per_s?.toFixed(0)}
+          value={fmtTps(result.baseline_tok_per_s)}
           unit="tok/s"
           sub={`${result.baseline_ms?.toFixed(1)} ms`}
         />
         <MetricCard
           label="Speculative"
-          value={result.spec_tok_per_s?.toFixed(0)}
+          value={fmtTps(result.spec_tok_per_s)}
           unit="tok/s"
           color="text-emerald-400"
           sub={`${result.spec_ms?.toFixed(1)} ms`}
@@ -202,11 +213,6 @@ export default function ResultsPanel({ result, loading }) {
               {result.spec_text || '—'}
             </p>
           </div>
-          <p className="text-xs text-zinc-600">
-            Greedy decoding with Llama-style RoPE on Q/K (SDEC v2{' '}
-            <code className="text-zinc-500">rope_theta</code>). HF may still differ slightly on very long contexts if{' '}
-            <code className="text-zinc-500">rope_scaling</code> is enabled there.
-          </p>
         </div>
       ) : null}
 

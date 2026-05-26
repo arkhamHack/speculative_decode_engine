@@ -25,6 +25,7 @@ struct Args {
     float  adapt_gain        = 0.055f;   // --adapt-gain=G
     float  adapt_ewma_mix    = 0.25f;   // --adapt-ewma=M (smoothing λ on per-round rate)
     unsigned spec_rng_seed = 12345;       // --spec-seed=N
+    int    eos_token        = -1;         // --eos-token=N  (HF eos_token_id; -1 = disabled)
     char   draft_path[512]  = "";         // --draft=path/to/draft.bin
     char   target_path[512] = "";         // --target=path/to/target.bin
     char   prompt_tok[512]  = "";         // --prompt-tok=path/to/prompt.tok
@@ -87,6 +88,8 @@ static void parse_args(Args& args, int argc, char** argv) {
             args.adapt_ewma_mix = static_cast<float>(atof(argv[i] + 14));
         } else if (strncmp(argv[i], "--spec-seed=", 12) == 0) {
             args.spec_rng_seed = (unsigned)atoi(argv[i] + 12);
+        } else if (strncmp(argv[i], "--eos-token=", 12) == 0) {
+            args.eos_token = atoi(argv[i] + 12);
         } else if (strncmp(argv[i], "--prompt-len=", 13) == 0) {
             args.prompt_len = atoi(argv[i] + 13);
         } else if (strncmp(argv[i], "--draft=", 8) == 0) {
@@ -222,6 +225,10 @@ int main(int argc, char** argv) {
     params.stochastic_adapt_target_accept = args.adapt_accept_target;
     params.stochastic_adapt_temp_gain     = args.adapt_gain;
     params.stochastic_adapt_ewma_mix       = args.adapt_ewma_mix;
+    params.eos_token                       = args.eos_token;
+
+    if (args.eos_token >= 0)
+        printf("EOS token: %d\n", args.eos_token);
 
     // ---- Warmup ----
     printf("Warming up (first-call JIT and CUDA init)...\n");

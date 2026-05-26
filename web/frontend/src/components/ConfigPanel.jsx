@@ -143,7 +143,7 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
 
         <Slider label="Draft tokens k" value={config.k} min={1} max={8} onChange={set('k')}
           format={v => `k = ${v}`} />
-        <Slider label="Max tokens" value={config.maxTokens} min={8} max={128} step={8} onChange={set('maxTokens')} />
+        <Slider label="Max tokens" value={config.maxTokens} min={8} max={512} step={8} onChange={set('maxTokens')} />
         {!config.production && (
           <>
             <Slider label="Prompt length" value={config.promptLen} min={1} max={16} onChange={set('promptLen')} />
@@ -159,13 +159,93 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
             </div>
           </>
         )}
-        {config.production && (
-          <p className="text-xs text-zinc-500">
-            Dummy <span className="text-zinc-400">prompt length</span> and <span className="text-zinc-400">seed</span> are
-            not used — the text prompt below is encoded with the tokenizer.
-          </p>
-        )}
       </div>
+
+      {/* Stochastic spec decode */}
+      {config.spec && (
+        <div className="card space-y-4">
+          <div className="flex items-center gap-2">
+            <Zap size={14} className="text-purple-400" />
+            <span className="label">Sampling Mode</span>
+          </div>
+
+          <Toggle
+            value={config.stochastic}
+            onChange={set('stochastic')}
+            label="Stochastic spec decode"
+            description="Exact paper algorithm (Leviathan et al.) — preserves target distribution"
+          />
+
+          {config.stochastic && (
+            <div className="space-y-4 pl-1 border-l-2 border-purple-800/60">
+              <Slider
+                label="Draft temperature"
+                value={config.draftTemp}
+                min={0.1}
+                max={2.0}
+                step={0.05}
+                onChange={set('draftTemp')}
+                format={v => v.toFixed(2)}
+              />
+
+              <Toggle
+                value={config.adaptiveDraftTemp}
+                onChange={set('adaptiveDraftTemp')}
+                label="Adaptive temperature"
+                description="EWMA-nudge draft temp toward target acceptance rate"
+              />
+
+              {config.adaptiveDraftTemp && (
+                <div className="space-y-3 pl-1 border-l border-zinc-700">
+                  <Slider
+                    label="Accept target α"
+                    value={config.adaptAccept}
+                    min={0.1}
+                    max={0.95}
+                    step={0.05}
+                    onChange={set('adaptAccept')}
+                    format={v => v.toFixed(2)}
+                  />
+                  <Slider
+                    label="Temp gain"
+                    value={config.adaptGain}
+                    min={0.001}
+                    max={0.2}
+                    step={0.001}
+                    onChange={set('adaptGain')}
+                    format={v => v.toFixed(3)}
+                  />
+                  <Slider
+                    label="EWMA mix λ"
+                    value={config.adaptEwma}
+                    min={0.05}
+                    max={0.95}
+                    step={0.05}
+                    onChange={set('adaptEwma')}
+                    format={v => v.toFixed(2)}
+                  />
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <div className="label">RNG seed</div>
+                <input
+                  type="number"
+                  value={config.specSeed}
+                  min={0}
+                  onChange={e => set('specSeed')(Number(e.target.value))}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-sm font-mono text-zinc-200 focus:outline-none focus:border-purple-500"
+                />
+              </div>
+
+              <div className="text-[11px] text-zinc-500 leading-relaxed border-l-2 border-zinc-700 pl-2">
+                Greedy (off): token match. Stochastic (on): accept with prob min(1, p/q).
+                Use <span className="text-zinc-300">megakernel</span> for stochastic — it avoids all CPU syncs.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Production: real SDEC weights + prompt */}
       <div className="card space-y-4">
@@ -173,11 +253,6 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
           production={config.production}
           onChange={(v) => set('production')(v)}
         />
-        <p className="text-[11px] text-zinc-500 leading-relaxed border-l-2 border-zinc-700 pl-3">
-          Export <code className="text-zinc-400">.bin</code> from Hugging Face checkpoints with{' '}
-          <code className="text-zinc-400">python tools/export_model.py &lt;model&gt; -o path.bin</code>{' '}
-          (see script header for supported architectures).
-        </p>
         {config.production && (
           <div className="space-y-3">
             <div className="space-y-1">
@@ -210,6 +285,12 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
                 className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
               />
             </div>
+            <Toggle
+              value={config.useChatTemplate}
+              onChange={set('useChatTemplate')}
+              label="Apply chat template"
+              description="Wrap prompt with HF chat template (disable for raw text / base models)"
+            />
             <div className="space-y-1">
               <div className="label">Prompt text</div>
               <textarea

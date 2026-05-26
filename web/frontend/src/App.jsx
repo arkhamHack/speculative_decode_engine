@@ -12,7 +12,7 @@ const DEFAULT_CONFIG = {
   mode:      'multi',
   spec:      true,
   k:         4,
-  maxTokens: 32,
+  maxTokens: 128,
   promptLen: 4,
   seed:      42,
   production: false,
@@ -20,6 +20,15 @@ const DEFAULT_CONFIG = {
   targetPath: '',
   tokenizerModel: '',
   promptText: 'Once upon a time',
+  useChatTemplate: true,
+  // Stochastic spec decode (Leviathan et al. exact algorithm)
+  stochastic:        false,
+  draftTemp:         1.0,
+  adaptiveDraftTemp: false,
+  adaptAccept:       0.5,
+  adaptGain:         0.055,
+  adaptEwma:         0.25,
+  specSeed:          12345,
 }
 
 async function apiFetch(path, body) {
@@ -110,6 +119,13 @@ export default function App() {
     k:           config.k,
     seed:        config.seed,
     prompt_len:  config.promptLen,
+    stochastic:          config.stochastic,
+    draft_temp:          config.draftTemp,
+    adaptive_draft_temp: config.adaptiveDraftTemp,
+    adapt_accept:        config.adaptAccept,
+    adapt_gain:          config.adaptGain,
+    adapt_ewma:          config.adaptEwma,
+    spec_seed:           config.specSeed,
     ...(config.production
       ? {
           production: true,
@@ -117,6 +133,7 @@ export default function App() {
           target_path: config.targetPath,
           tokenizer_model: config.tokenizerModel,
           prompt_text: config.promptText,
+          use_chat_template: config.useChatTemplate,
         }
       : { production: false }),
   })
@@ -158,6 +175,13 @@ export default function App() {
         k_max:      config.k,
         seed:       config.seed,
         prompt_len: config.promptLen,
+        stochastic:          config.stochastic,
+        draft_temp:          config.draftTemp,
+        adaptive_draft_temp: config.adaptiveDraftTemp,
+        adapt_accept:        config.adaptAccept,
+        adapt_gain:          config.adaptGain,
+        adapt_ewma:          config.adaptEwma,
+        spec_seed:           config.specSeed,
         ...(config.production
           ? {
               production: true,
@@ -165,6 +189,7 @@ export default function App() {
               target_path: config.targetPath,
               tokenizer_model: config.tokenizerModel,
               prompt_text: config.promptText,
+              use_chat_template: config.useChatTemplate,
             }
           : { production: false }),
       })
