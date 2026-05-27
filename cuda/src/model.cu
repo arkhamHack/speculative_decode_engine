@@ -895,9 +895,12 @@ void inference_engine_init(InferenceEngine& eng, const ModelConfig& cfg) {
                                      cudaDevAttrCooperativeLaunch, 0));
     eng.coop_supported = (coop_attr != 0);
 
-    // Conservative cap: 4 blocks per SM.  cudaLaunchCooperativeKernel validates
-    // the actual limit; this prevents requesting an absurd grid size at init.
-    eng.max_coop_blocks = prop.multiProcessorCount * 4;
+    // Upper bound on grid size passed to launch_cooperative_decode_step.
+    // The actual per-launch cap is tighter: it's recomputed from
+    // cudaOccupancyMaxActiveBlocksPerMultiprocessor each call so that
+    // large-model smem requirements (e.g. 40 KB/block on RTX 3050) are
+    // respected.  Use 2 blocks/SM here so this value never over-counts.
+    eng.max_coop_blocks = prop.multiProcessorCount * 2;
 
     // cuBLAS handle
     CUBLAS_CHECK(cublasCreate(&eng.cublas));

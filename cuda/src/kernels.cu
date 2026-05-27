@@ -1850,10 +1850,28 @@ static void launch_cooperative_decode_step(
     size_t smem = compute_smem_bytes(model.cfg);
     cuda_configure_kernel_dynamic_smem(cooperative_decode_kernel, smem);
 
+    // Query the true per-SM occupancy AFTER setting the smem attribute so the
+    // calculator sees the real shared-memory footprint.  On consumer GPUs
+    // (RTX 3050: 48 KB/SM, sm_86) large models can limit blocks_per_sm to 1,
+    // giving a cooperative-launch limit of only n_sm × 1 blocks.  Exceeding
+    // that limit causes cudaErrorInvalidConfiguration at launch.
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        (void*)cooperative_decode_kernel,
+        BLOCK_THREADS, smem);
+    if (blocks_per_sm < 1) blocks_per_sm = 1;
+
+    int dev = 0;  cudaGetDevice(&dev);
+    int sm_count = 1;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+    int hard_limit = sm_count * blocks_per_sm;   // max blocks for coop launch
+
     int n_blocks_needed = (V + GEMV_COL_TILE - 1) / GEMV_COL_TILE;
-    int n_blocks = (n_blocks_needed < max_coop_blocks) ? n_blocks_needed
-                                                        : max_coop_blocks;
-    if (n_blocks < 1) n_blocks = 1;
+    int n_blocks = n_blocks_needed;
+    if (n_blocks > max_coop_blocks) n_blocks = max_coop_blocks;
+    if (n_blocks > hard_limit)      n_blocks = hard_limit;
+    if (n_blocks < 1)               n_blocks = 1;
 
     void* args[] = {
         (void*)&model,

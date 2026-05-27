@@ -205,4 +205,4 @@ async def sweep(req: SweepRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server:app", host="127.0.0.1", port=8002, reload=True)
+    uvicorn.run("server:app", host="127.0.0.1", port=8001, reload=True)
