@@ -29,6 +29,7 @@ _EXE_CANDIDATES = [
     _BUILD_DIR / "RelWithDebInfo" / "spec_decode.exe",
     _BUILD_DIR / "MinSizeRel" / "spec_decode.exe",
 ]
+_EXE_EOS_SUPPORT: dict[Path, bool] = {}
 
 
 def find_exe() -> Optional[Path]:
@@ -42,6 +43,29 @@ def find_exe() -> Optional[Path]:
         if p.exists():
             return p
     return None
+
+
+def exe_supports_eos_token(exe: Path) -> bool:
+    """Return whether this spec_decode build accepts --eos-token."""
+    exe = exe.resolve()
+    cached = _EXE_EOS_SUPPORT.get(exe)
+    if cached is not None:
+        return cached
+
+    try:
+        proc = subprocess.run(
+            [str(exe), "--eos-token=0", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(exe.parent),
+        )
+        supported = proc.returncode == 0
+    except Exception:
+        supported = False
+
+    _EXE_EOS_SUPPORT[exe] = supported
+    return supported
 
 
 def resolve_user_path(p: str) -> Path:
@@ -376,7 +400,7 @@ def run_benchmark(
                 f"--max-tokens={max_tokens}",
                 f"--k={k}",
             ]
-            if eos_token_id >= 0:
+            if eos_token_id >= 0 and exe_supports_eos_token(exe):
                 cmd.append(f"--eos-token={eos_token_id}")
             if stochastic:
                 cmd.append("--stochastic-spec")

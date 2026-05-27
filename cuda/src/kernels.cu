@@ -140,6 +140,46 @@ __global__ void stochastic_draft_forward_sample_kernel(
     __syncthreads();
 }
 
+// Device-pointer variant: reads token_id from device memory so consecutive draft
+// steps can be chained without a CPU roundtrip between them.
+__global__ void stochastic_draft_forward_sample_dptr_kernel(
+        ModelWeights draft_model,
+        KVCache kv,
+        const int* d_token_id,   // ← device pointer (output of previous step)
+        int seq_len,
+        float temperature,
+        curandState* rng,
+        float* g_logits,
+        int* sampled_id,
+        float* sampled_q_prob) {
+    extern __shared__ float shared[];
+
+    int token_id = d_token_id[0];
+    int d = draft_model.cfg.d_model;
+    int V = draft_model.cfg.vocab_size;
+    float* hidden = shared;
+    float* smem   = shared + d;
+
+    model_forward_logits(draft_model, kv, token_id, seq_len, hidden, g_logits, smem);
+    __syncthreads();
+
+    float* softmax_scratch = hidden;
+    logits_inplace_softmax_temp(g_logits, V, temperature, softmax_scratch);
+
+    if (threadIdx.x == 0) {
+        float u      = curand_uniform(rng);
+        float cdf    = 0.f;
+        int   choice = V - 1;
+        for (int i = 0; i < V; i++) {
+            cdf += g_logits[i];
+            if (u <= cdf || i == V - 1) { choice = i; break; }
+        }
+        sampled_id[0]     = choice;
+        sampled_q_prob[0] = g_logits[choice];
+    }
+    __syncthreads();
+}
+
 // Forward target, then softmax p(idx) without destroying raw logits buffer.
 __global__ void target_forward_prob_mass_kernel(ModelWeights target_model,
                                                 KVCache kv,
@@ -179,6 +219,42 @@ __global__ void stochastic_accept_gate_kernel(float               p_mass,
     float q_eff = fmaxf(q_mass, 1e-36f);
     float cap   = fminf(1.f, p_mass / q_eff);
     accepted_flag[0] = (curand_uniform(rng_state) <= cap) ? 1 : 0;
+}
+
+// Fused kernel: target forward pass + p-mass computation + stochastic acceptance gate.
+// Replaces target_forward_prob_mass_kernel + stochastic_accept_gate_kernel (two launches,
+// two syncs, two memcpys) with a single launch + one sync + one memcpy per verify step.
+// g_logits holds raw target logits on exit (not mutated) so corrected_sample can follow.
+__global__ void target_fwd_prob_and_accept_kernel(
+        ModelWeights target_model,
+        KVCache kv,
+        int token_id, int seq_len,
+        int draft_token,    // token whose mass under target we test
+        float q_mass,       // draft probability mass for draft_token
+        float* g_logits,    // [vocab_size] — raw target logits on exit
+        curandState* rng,
+        int* accepted_flag) // 0 or 1
+{
+    extern __shared__ float shared[];
+    int d = target_model.cfg.d_model;
+    int V = target_model.cfg.vocab_size;
+    float* hidden   = shared;
+    float* lay_smem = shared + d;
+
+    model_forward_logits(target_model, kv, token_id, seq_len, hidden, g_logits, lay_smem);
+    __syncthreads();
+
+    // logits_softmax_prob_at_global is read-only; raw logits are preserved for
+    // corrected_sample_adjusted_logits_kernel that may follow a rejection.
+    float* softmax_reduction = hidden;
+    float pm = logits_softmax_prob_at_global(g_logits, V, draft_token, 1.f, softmax_reduction);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float q_eff = fmaxf(q_mass, 1e-36f);
+        float cap   = fminf(1.f, pm / q_eff);
+        accepted_flag[0] = (curand_uniform(rng) <= cap) ? 1 : 0;
+    }
 }
 
 // Shared device helpers — megakernel + multi-kernel use the same acceptance / sampling maths.
@@ -428,6 +504,24 @@ __global__ void gemv_global_kernel(
     int d_in, int d_out)
 {
     device_matvec(g_x, g_W, g_out, d_in, d_out);
+}
+
+// Multi-block GEMV: each block handles one BLOCK_THREADS-wide column tile.
+// Launch with <<<(d_out+BLOCK_THREADS-1)/BLOCK_THREADS, BLOCK_THREADS, 0, stream>>>.
+// Uses L1 read-only cache (__ldg) for weight matrix; input vector fits in L2.
+// Compared to gemv_global_kernel (1 SM) this fans out across all available SMs.
+__global__ void gemv_mb_kernel(
+    const float* __restrict__ g_x,
+    const half*  __restrict__ g_W,
+    float*       g_out,
+    int d_in, int d_out)
+{
+    int col = (int)blockIdx.x * blockDim.x + (int)threadIdx.x;
+    if (col >= d_out) return;
+    float acc = 0.f;
+    for (int row = 0; row < d_in; row++)
+        acc += g_x[row] * __half2float(__ldg(&g_W[row * d_out + col]));
+    g_out[col] = acc;
 }
 
 // In-place RoPE on Q and K stored in global memory.
@@ -681,6 +775,11 @@ static void launch_prefill_overlapped(
     // smem for RMSNorm kernels (warp-reduction scratch)
     const size_t smem_red = (BLOCK_THREADS / WARP_SIZE) * sizeof(float);
 
+    // Block counts for multi-block GEMV: one thread per output column.
+    // Falls back to 1 block for tiny dummy models (d < BLOCK_THREADS).
+    const int nb_d   = (d   + BLOCK_THREADS - 1) / BLOCK_THREADS;  // QKV / Wo
+    const int nb_dff = (dff + BLOCK_THREADS - 1) / BLOCK_THREADS;  // gate / up
+
     // ---- Embedding lookup ----
     embed_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
         model, token_id, g_hidden);
@@ -701,12 +800,12 @@ static void launch_prefill_overlapped(
         CUDA_CHECK(cudaStreamWaitEvent(s_k,      ev0, 0));
         CUDA_CHECK(cudaStreamWaitEvent(s_v_gate, ev0, 0));
 
-        // -- Q || K || V projections (three-way parallel) --
-        gemv_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
+        // -- Q || K || V projections (three-way parallel, multi-block) --
+        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_main>>>(
             g_normed, lw.Wq, g_q, d, d);                       // Q on s_main
-        gemv_global_kernel<<<1, BLOCK_THREADS, 0, s_k>>>(
+        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_k>>>(
             g_normed, lw.Wk, g_k, d, d);                       // K on s_k
-        gemv_global_kernel<<<1, BLOCK_THREADS, 0, s_v_gate>>>(
+        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_v_gate>>>(
             g_normed, lw.Wv, g_v, d, d);                       // V on s_v_gate
 
         CUDA_CHECK(cudaEventRecord(ev1, s_k));       // K done
@@ -727,8 +826,8 @@ static void launch_prefill_overlapped(
             g_q, g_attn, kv, l, d, nh, seq_pos + 1,
             rsqrtf((float)dph));
 
-        // -- Wo projection + residual add --
-        gemv_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
+        // -- Wo projection + residual add (multi-block) --
+        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_main>>>(
             g_attn, lw.Wo, g_normed, d, d);        // g_normed = Wo * attn_out
         residual_add_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
             g_hidden, g_normed, d);                 // hidden += Wo_out
@@ -745,10 +844,10 @@ static void launch_prefill_overlapped(
         // Tell up stream to wait for normed before starting its projection
         CUDA_CHECK(cudaStreamWaitEvent(s_v_gate, ev0, 0));
 
-        // -- Gate || Up projections (two-way parallel, full width) --
-        proj_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
+        // -- Gate || Up projections (two-way parallel, multi-block) --
+        gemv_mb_kernel<<<nb_dff, BLOCK_THREADS, 0, s_main>>>(
             g_normed, lw.W_gate, g_gate, d, dff);   // gate on s_main
-        proj_global_kernel<<<1, BLOCK_THREADS, 0, s_v_gate>>>(
+        gemv_mb_kernel<<<nb_dff, BLOCK_THREADS, 0, s_v_gate>>>(
             g_normed, lw.W_up,   g_up,  d, dff);    // up on s_v_gate
 
         CUDA_CHECK(cudaEventRecord(ev2, s_v_gate));  // up done
@@ -1324,9 +1423,13 @@ void multikernel_speculative(const ModelWeights& draft_model,
 
         cuda_configure_kernel_dynamic_smem(stochastic_draft_forward_sample_kernel,
                                              draft_smem);
+        cuda_configure_kernel_dynamic_smem(stochastic_draft_forward_sample_dptr_kernel,
+                                             draft_smem);
         cuda_configure_kernel_dynamic_smem(single_token_forward_logits_kernel,
                                            max_decode_smem);
         cuda_configure_kernel_dynamic_smem(target_forward_prob_mass_kernel,
+                                           target_smem);
+        cuda_configure_kernel_dynamic_smem(target_fwd_prob_and_accept_kernel,
                                            target_smem);
         cuda_configure_kernel_dynamic_smem(softmax_sample_temperature_kernel,
                                            0);
@@ -1356,6 +1459,15 @@ void multikernel_speculative(const ModelWeights& draft_model,
         float  draft_temp_dyn = params.draft_temperature;
         float  ewma_accept    = -1.f;
 
+        // Device-side buffers for chained draft sampling — avoids k CPU roundtrips
+        // per speculation round by keeping tokens on device until all k are ready.
+        int*   d_draft_tokens_dev = nullptr;
+        float* d_q_probs_dev      = nullptr;
+        int*   d_ctx_seed         = nullptr;   // bootstrap: device copy of last_token
+        CUDA_CHECK(cudaMalloc(&d_draft_tokens_dev, (size_t)k * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_q_probs_dev,      (size_t)k * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_ctx_seed,          sizeof(int)));
+
         while (generated < max_new) {
             iterations++;
             int remaining = max_new - generated;
@@ -1365,23 +1477,31 @@ void multikernel_speculative(const ModelWeights& draft_model,
             int target_seq_save = target_seq;
             total_proposed += current_k;
 
-            int draft_ctx = last_token;
-            for (int di = 0; di < current_k; di++) {
-                stochastic_draft_forward_sample_kernel
-                    <<<1, BLOCK_THREADS, draft_smem>>>(
-                        draft_model, draft_kv, draft_ctx, draft_seq,
-                        draft_temp_dyn, d_rng, g_logits_draft, d_next,
-                        d_q_mass_out);
-                CUDA_CHECK(cudaDeviceSynchronize());
-                CUDA_CHECK(cudaMemcpy(&h_draft_tokens[di], d_next,
-                                      sizeof(int), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&h_q_probs[di], d_q_mass_out,
-                                      sizeof(float), cudaMemcpyDeviceToHost));
+            // ---- Draft phase: fully chained on GPU, no per-step sync ----
+            // Seed: copy last_token to device so step 0 can read it as a pointer.
+            CUDA_CHECK(cudaMemcpy(d_ctx_seed, &last_token, sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            const int* d_ctx_ptr = d_ctx_seed;
 
-                draft_ctx = h_draft_tokens[di];
+            for (int di = 0; di < current_k; di++) {
+                stochastic_draft_forward_sample_dptr_kernel
+                    <<<1, BLOCK_THREADS, draft_smem>>>(
+                        draft_model, draft_kv, d_ctx_ptr, draft_seq,
+                        draft_temp_dyn, d_rng, g_logits_draft,
+                        d_draft_tokens_dev + di, d_q_probs_dev + di);
+                // Chain: next step reads the token this step just wrote on device.
+                d_ctx_ptr = d_draft_tokens_dev + di;
                 draft_seq++;
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
             }
+            // One sync + one batch copy for all k draft tokens and probabilities.
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(h_draft_tokens, d_draft_tokens_dev,
+                                  (size_t)current_k * sizeof(int),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_q_probs, d_q_probs_dev,
+                                  (size_t)current_k * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
 
             int n_accept_round = 0;
             int bonus          = -1; // sentinel: "no bonus token yet"
@@ -1391,18 +1511,13 @@ void multikernel_speculative(const ModelWeights& draft_model,
             for (int vi = 0; vi < current_k; vi++) {
                 int inp = (vi == 0) ? last_token : h_draft_tokens[vi - 1];
 
-                target_forward_prob_mass_kernel
+                // Fused target forward + acceptance gate: one launch, one sync,
+                // one memcpy per verification step (was two launches + two syncs).
+                target_fwd_prob_and_accept_kernel
                     <<<1, BLOCK_THREADS, target_smem>>>(
                         target_model, target_kv, inp, target_roll,
-                        h_draft_tokens[vi], g_logits_target, d_p_mass_out);
-                CUDA_CHECK(cudaDeviceSynchronize());
-
-                float p_mass = 0.f;
-                CUDA_CHECK(cudaMemcpy(&p_mass, d_p_mass_out, sizeof(float),
-                                      cudaMemcpyDeviceToHost));
-
-                stochastic_accept_gate_kernel<<<1, 1>>>(
-                    p_mass, h_q_probs[vi], d_rng, d_accept);
+                        h_draft_tokens[vi], h_q_probs[vi],
+                        g_logits_target, d_rng, d_accept);
                 CUDA_CHECK(cudaDeviceSynchronize());
 
                 int acc_flag = 0;
@@ -1523,6 +1638,9 @@ void multikernel_speculative(const ModelWeights& draft_model,
         }
 
         delete[] h_q_probs;
+        cudaFree(d_ctx_seed);
+        cudaFree(d_q_probs_dev);
+        cudaFree(d_draft_tokens_dev);
         cudaFree(d_corr_work);
         cudaFree(d_accept);
         cudaFree(d_q_mass_out);
