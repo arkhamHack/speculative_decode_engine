@@ -2,6 +2,8 @@
 #include "config.h"
 #include "kv_cache.h"
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <cstdint>
 
 // ============================================================================
 // Weight layout  (all tensors in half precision, 16-byte aligned on device)
@@ -128,3 +130,70 @@ __device__ void model_batch_forward_logits(
     const int* token_ids, int seq_base, int B,
     float* g_hidden, float* g_work, float* g_logits,
     float* smem);
+
+// ============================================================================
+// InferenceEngine — host-side state for cuBLAS handle, CUDA stream pool,
+// cooperative-launch capability, and scratch buffers for the cooperative
+// single-token decode kernel.
+//
+// Streams:
+//   streams[0]  -- draft prefill / intra-layer stream A
+//   streams[1]  -- target prefill / intra-layer stream B
+//   streams[2..STREAM_POOL_SIZE-1] -- spare
+// sync_events[] -- per-stream cudaEvent_t for cross-stream dependencies
+//
+// Cooperative single-token decode scratch (one pair per concurrent model):
+//   d_coop_hidden  / d_coop_scratch  -- used by target (stream[1]) or baseline
+//   d_coop_hidden2 / d_coop_scratch2 -- used by draft  (stream[0]) in parallel prefill
+// Both are sized for the LARGEST model passed to inference_engine_init.
+// ============================================================================
+struct InferenceEngine {
+    cublasHandle_t cublas;
+    cudaStream_t   streams[STREAM_POOL_SIZE];
+    cudaEvent_t    sync_events[STREAM_POOL_SIZE];
+
+    int  sm_major, sm_minor;
+    bool coop_supported;   // device supports cudaLaunchCooperativeKernel
+    int  max_coop_blocks;  // conservative cap for cooperative_decode_kernel
+
+    // Cooperative single-token decode residual stream + scratch
+    float* d_coop_hidden;   // [d_model]
+    float* d_coop_scratch;  // [7*d_model + 2*MLP_FF_TILE]
+
+    // Second set so draft and target streams don't alias during parallel prefill
+    float* d_coop_hidden2;
+    float* d_coop_scratch2;
+
+    // -----------------------------------------------------------------------
+    // Intra-layer stream-overlap scratch for Q/K/V and gate/up projections.
+    //
+    // d_ovl_buf[0] = target model (stream[1])
+    // d_ovl_buf[1] = draft model  (stream[0])
+    //
+    // Buffer layout per set — [7*d + 2*dff] floats (d = ovl_buf_d, dff = ovl_buf_dff):
+    //   [0..d)            hidden state (residual stream)
+    //   [d..2d)           RMSNorm output scratch
+    //   [2d..3d)          Q projection
+    //   [3d..4d)          K projection
+    //   [4d..5d)          V projection
+    //   [5d..6d)          attention output (pre-Wo)
+    //   [6d..7d)          MLP accumulator
+    //   [7d..7d+dff)      gate projection output (full, not tiled)
+    //   [7d+dff..7d+2dff) up  projection output (full, not tiled)
+    // -----------------------------------------------------------------------
+    float* d_ovl_buf[2];
+    int    ovl_buf_d;    // d_model for which d_ovl_buf was sized
+    int    ovl_buf_dff;  // d_ff   for which d_ovl_buf was sized
+
+    // CUDA events for intra-layer projection synchronisation:
+    //   ovl_events[0] — RMSNorm done / Q projection done
+    //   ovl_events[1] — K projection done / gate projection done
+    //   ovl_events[2] — V projection done / up  projection done
+    cudaEvent_t ovl_events[3];
+};
+
+// Allocate and initialise the engine for the given (largest) model config.
+void inference_engine_init(InferenceEngine& eng, const ModelConfig& cfg);
+
+// Release all resources held by the engine.
+void inference_engine_destroy(InferenceEngine& eng);

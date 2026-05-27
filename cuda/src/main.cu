@@ -208,6 +208,15 @@ int main(int argc, char** argv) {
     kv_cache_alloc(target_kv,   tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
     kv_cache_alloc(baseline_kv, tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
 
+    // ---- Initialise InferenceEngine (cooperative launch + stream pool) ----
+    // Sized for the target (larger) model — draft d_model ≤ target d_model.
+    InferenceEngine eng;
+    inference_engine_init(eng, target_model.cfg);
+    printf("InferenceEngine: SM%d.%d | coop_launch=%s | max_coop_blocks=%d\n",
+           eng.sm_major, eng.sm_minor,
+           eng.coop_supported ? "yes" : "no",
+           eng.max_coop_blocks);
+
     // ---- Result buffers ----
     GenerationResult* d_baseline_result;
     GenerationResult* d_spec_result;
@@ -249,7 +258,7 @@ int main(int argc, char** argv) {
                             d_prompt, prompt_len, d_baseline_result, params);
     } else {
         multikernel_baseline(target_model, baseline_kv,
-                             h_prompt, prompt_len, d_baseline_result, params);
+                             h_prompt, prompt_len, d_baseline_result, params, &eng);
     }
     CUDA_CHECK(cudaEventRecord(ev_stop));
     CUDA_CHECK(cudaEventSynchronize(ev_stop));
@@ -279,7 +288,7 @@ int main(int argc, char** argv) {
     } else {
         multikernel_speculative(draft_model, target_model,
                                 draft_kv, target_kv,
-                                h_prompt, prompt_len, d_spec_result, params);
+                                h_prompt, prompt_len, d_spec_result, params, &eng);
     }
     CUDA_CHECK(cudaEventRecord(ev_stop));
     CUDA_CHECK(cudaEventSynchronize(ev_stop));
@@ -357,6 +366,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- Cleanup ----
+    inference_engine_destroy(eng);
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_stop));
     cudaFree(d_prompt);

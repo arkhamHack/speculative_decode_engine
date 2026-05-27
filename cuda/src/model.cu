@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <cublas_v2.h>
 #include <curand_kernel.h>
 
 // ============================================================================
@@ -876,4 +877,72 @@ __device__ void model_batch_forward_logits(
         __syncthreads();
     }
     device_matvec_batched(g_normed, model.output_proj, g_logits_out, d, V, B);
+}
+
+// ============================================================================
+// InferenceEngine: init / destroy
+// ============================================================================
+
+void inference_engine_init(InferenceEngine& eng, const ModelConfig& cfg) {
+    // Query device capabilities
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    eng.sm_major = prop.major;
+    eng.sm_minor = prop.minor;
+
+    int coop_attr = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&coop_attr,
+                                     cudaDevAttrCooperativeLaunch, 0));
+    eng.coop_supported = (coop_attr != 0);
+
+    // Conservative cap: 4 blocks per SM.  cudaLaunchCooperativeKernel validates
+    // the actual limit; this prevents requesting an absurd grid size at init.
+    eng.max_coop_blocks = prop.multiProcessorCount * 4;
+
+    // cuBLAS handle
+    CUBLAS_CHECK(cublasCreate(&eng.cublas));
+    if (eng.sm_major >= 8)
+        CUBLAS_CHECK(cublasSetMathMode(eng.cublas, CUBLAS_TENSOR_OP_MATH));
+
+    // Stream pool + events
+    for (int i = 0; i < STREAM_POOL_SIZE; i++) {
+        CUDA_CHECK(cudaStreamCreate(&eng.streams[i]));
+        CUDA_CHECK(cudaEventCreate(&eng.sync_events[i]));
+    }
+
+    // Cooperative single-token decode scratch
+    // Two independent copies so draft (stream[0]) and target (stream[1]) can
+    // run concurrently during prefill without aliasing the residual buffer.
+    const int d = cfg.d_model;
+    size_t scratch_n = (size_t)(7 * d + 2 * MLP_FF_TILE);
+    CUDA_CHECK(cudaMalloc(&eng.d_coop_hidden,   (size_t)d * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&eng.d_coop_scratch,  scratch_n  * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&eng.d_coop_hidden2,  (size_t)d * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&eng.d_coop_scratch2, scratch_n  * sizeof(float)));
+
+    // Intra-layer stream-overlap projection scratch (two sets: target + draft).
+    // Each set: [7*d_model + 2*d_ff] floats.  See model.h for layout details.
+    eng.ovl_buf_d   = cfg.d_model;
+    eng.ovl_buf_dff = cfg.d_ff;
+    size_t ovl_n = (size_t)(7 * cfg.d_model + 2 * cfg.d_ff);
+    for (int s = 0; s < 2; s++) {
+        eng.d_ovl_buf[s] = nullptr;
+        CUDA_CHECK(cudaMalloc(&eng.d_ovl_buf[s], ovl_n * sizeof(float)));
+    }
+    for (int e = 0; e < 3; e++)
+        CUDA_CHECK(cudaEventCreate(&eng.ovl_events[e]));
+}
+
+void inference_engine_destroy(InferenceEngine& eng) {
+    cublasDestroy(eng.cublas);
+    for (int i = 0; i < STREAM_POOL_SIZE; i++) {
+        cudaStreamDestroy(eng.streams[i]);
+        cudaEventDestroy(eng.sync_events[i]);
+    }
+    auto sf = [](void* p) { if (p) cudaFree(p); };
+    sf(eng.d_coop_hidden);   sf(eng.d_coop_scratch);
+    sf(eng.d_coop_hidden2);  sf(eng.d_coop_scratch2);
+    for (int s = 0; s < 2; s++) sf(eng.d_ovl_buf[s]);
+    for (int e = 0; e < 3; e++) cudaEventDestroy(eng.ovl_events[e]);
+    memset(&eng, 0, sizeof(eng));
 }

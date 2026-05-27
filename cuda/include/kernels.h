@@ -9,20 +9,24 @@
 // ============================================================================
 
 // Baseline autoregressive: target model only, one token at a time.
+// eng: optional InferenceEngine for cooperative-launch and stream-overlap paths.
 void multikernel_baseline(const ModelWeights& target_model,
                           KVCache& target_kv,
                           const int* prompt, int prompt_len,
                           GenerationResult* d_result,
-                          const GenerationParams& params);
+                          const GenerationParams& params,
+                          InferenceEngine* eng = nullptr);
 
 // Speculative decoding: draft proposes, target verifies.
+// eng: optional InferenceEngine for cooperative-launch and stream-overlap paths.
 void multikernel_speculative(const ModelWeights& draft_model,
                              const ModelWeights& target_model,
                              KVCache& draft_kv,
                              KVCache& target_kv,
                              const int* prompt, int prompt_len,
                              GenerationResult* d_result,
-                             const GenerationParams& params);
+                             const GenerationParams& params,
+                             InferenceEngine* eng = nullptr);
 
 // ============================================================================
 // Persistent megakernel path: typically a single launch (no CPU sync mid-decode).

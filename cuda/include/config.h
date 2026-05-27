@@ -27,6 +27,12 @@ constexpr int MLP_FF_TILE      = 256;
 // Supports spec_k up to 8; raise and add cases to the dispatch switches in utils.h if needed.
 constexpr int MAX_VERIFY_BATCH = 9;
 
+// Output columns per cooperative GEMV block (multi-block single-token decode).
+constexpr int GEMV_COL_TILE    = 128;
+
+// Size of the CUDA stream pool used for overlapping independent projections.
+constexpr int STREAM_POOL_SIZE = 4;
+
 // Default vocabulary for the built-in dummy integer tokenizer
 constexpr int DEFAULT_VOCAB_SIZE = 256;
 // Sentinel: no EOS for the dummy tokenizer (tokens 0-255 all valid)

@@ -1,7 +1,9 @@
 #pragma once
 #include "config.h"
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cfloat>
+#include <cstdint>
 
 // ============================================================================
 // Warp-level reductions using __shfl_xor_sync
@@ -365,6 +367,64 @@ void load_half_to_float(const half* src, float* dst, int n, int tid, int stride)
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
+
+// ============================================================================
+// cuBLAS error-checking macro (host code only)
+// ============================================================================
+
+#define CUBLAS_CHECK(call)                                                      \
+    do {                                                                        \
+        cublasStatus_t _st = (call);                                            \
+        if (_st != CUBLAS_STATUS_SUCCESS) {                                     \
+            fprintf(stderr, "cuBLAS error %d at %s:%d\n",                      \
+                    (int)_st, __FILE__, __LINE__);                              \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+
+// ============================================================================
+// device_matvec_partial
+//
+// Partial column-stripe matrix-vector multiply: computes
+//   out[col_start .. col_start+col_count) += x[0..d_in) @ W[0..d_in, col_start..col_start+col_count)
+//
+// Allows multiple cooperative blocks to split the output dimension, each
+// writing to a distinct stripe of the output array with no race conditions.
+// FP16 weights, FP32 accumulation.
+// ============================================================================
+__device__ __forceinline__ void device_matvec_partial(
+        const float* __restrict__ x,      // [d_in]  input activation
+        const half*  __restrict__ W,      // [d_in × d_out] row-major FP16 weights
+        float*                    out,    // [d_out] output (stripe written)
+        int d_in, int d_out,
+        int col_start, int col_count) {
+    int tid = threadIdx.x;
+    for (int oc = tid; oc < col_count; oc += blockDim.x) {
+        float acc = 0.f;
+        int c = col_start + oc;
+        for (int r = 0; r < d_in; r++)
+            acc += x[r] * __half2float(__ldg(&W[r * d_out + c]));
+        out[c] = acc;
+    }
+}
+
+// INT8 variant (W8A16): W_q is int8, scale is per-row FP16 applied before accumulation.
+__device__ __forceinline__ void device_matvec_int8_partial(
+        const float*   __restrict__ x,
+        const int8_t*  __restrict__ W_q,
+        const half*    __restrict__ scale,
+        float*                      out,
+        int d_in, int d_out,
+        int col_start, int col_count) {
+    int tid = threadIdx.x;
+    for (int oc = tid; oc < col_count; oc += blockDim.x) {
+        float acc = 0.f;
+        int c = col_start + oc;
+        for (int r = 0; r < d_in; r++)
+            acc += x[r] * __half2float(scale[r]) * (float)__ldg(&W_q[r * d_out + c]);
+        out[c] = acc;
+    }
+}
 
 // ============================================================================
 // Host-side alignment helper
