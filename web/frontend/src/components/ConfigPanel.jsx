@@ -112,7 +112,47 @@ function WeightSourcePicker({ production, onChange }) {
   )
 }
 
-export default function ConfigPanel({ config, onChange, onRun, onCompare, onSweep, loading }) {
+function SpecModePicker({ specMode, onChange, disabled }) {
+  const modes = [
+    {
+      id: 'two_model',
+      label: 'Two-model',
+      desc: 'Separate draft + target checkpoints',
+    },
+    {
+      id: 'self_spec',
+      label: 'Self-speculative',
+      desc: 'Early layers draft, full model verifies',
+    },
+  ]
+  return (
+    <div className="space-y-2">
+      <div className="label">Speculation strategy</div>
+      <div className="grid grid-cols-1 gap-2">
+        {modes.map(m => (
+          <button
+            key={m.id}
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange(m.id)}
+            className={`rounded-lg border px-3 py-2.5 text-left transition-all duration-150 ${
+              specMode === m.id
+                ? 'border-purple-500 bg-purple-500/15 text-purple-300 ring-1 ring-purple-500/40'
+                : 'border-zinc-700 bg-zinc-800/50 text-zinc-400 hover:border-zinc-600'
+            } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            <div className="text-xs font-semibold text-zinc-200">{m.label}</div>
+            <div className="text-[11px] text-zinc-500 mt-0.5 leading-snug">{m.desc}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export default function ConfigPanel({
+  config, onChange, onRun, onCompare, onSweep, onAutotune, loading,
+}) {
   const set = (key) => (val) => onChange({ ...config, [key]: val })
 
   return (
@@ -130,8 +170,26 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
           value={config.spec}
           onChange={set('spec')}
           label="Speculative Decoding"
-          description="Draft + target model"
+          description="Draft proposer + target verifier"
         />
+        {config.spec && (
+          <>
+            <SpecModePicker
+              specMode={config.specMode}
+              onChange={set('specMode')}
+            />
+            {config.specMode === 'self_spec' && (
+              <Slider
+                label="Draft layers (early exit)"
+                value={config.draftLayers}
+                min={1}
+                max={config.production ? 31 : 3}
+                onChange={set('draftLayers')}
+                format={v => `L = ${v}`}
+              />
+            )}
+          </>
+        )}
       </div>
 
       {/* Parameters */}
@@ -255,18 +313,22 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
         />
         {config.production && (
           <div className="space-y-3">
+            {config.specMode !== 'self_spec' && (
+              <div className="space-y-1">
+                <div className="label">Draft weights (.bin)</div>
+                <input
+                  type="text"
+                  value={config.draftPath}
+                  onChange={e => set('draftPath')(e.target.value)}
+                  placeholder="weights/draft.bin or absolute path"
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            )}
             <div className="space-y-1">
-              <div className="label">Draft weights (.bin)</div>
-              <input
-                type="text"
-                value={config.draftPath}
-                onChange={e => set('draftPath')(e.target.value)}
-                placeholder="weights/draft.bin or absolute path"
-                className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-blue-500"
-              />
-            </div>
-            <div className="space-y-1">
-              <div className="label">Target weights (.bin)</div>
+              <div className="label">
+                {config.specMode === 'self_spec' ? 'Model weights (.bin)' : 'Target weights (.bin)'}
+              </div>
               <input
                 type="text"
                 value={config.targetPath}
@@ -304,6 +366,52 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
         )}
       </div>
 
+      {/* Autotuner */}
+      {config.spec && (
+        <div className="card space-y-4">
+          <div className="label">Autotuner</div>
+          <Slider
+            label="Min acceptance α"
+            value={config.minAcceptance}
+            min={0.3}
+            max={0.95}
+            step={0.05}
+            onChange={set('minAcceptance')}
+            format={v => `${Math.round(v * 100)}%`}
+          />
+          <div className="space-y-2">
+            <div className="label">Optimize for</div>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { id: 'speedup', label: 'Speedup' },
+                { id: 'tok_per_s', label: 'Tok/s' },
+              ].map(o => (
+                <button
+                  key={o.id}
+                  type="button"
+                  onClick={() => set('autotuneObjective')(o.id)}
+                  className={`rounded-lg border px-2 py-1.5 text-xs font-medium transition-all ${
+                    config.autotuneObjective === o.id
+                      ? 'border-blue-500 bg-blue-500/15 text-blue-300'
+                      : 'border-zinc-700 text-zinc-500 hover:border-zinc-600'
+                  }`}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {config.stochastic && (
+            <Toggle
+              value={config.sweepTemp}
+              onChange={set('sweepTemp')}
+              label="Sweep draft temperature"
+              description="Search temp ∈ {0.6, 0.8, 1.0, 1.2} during autotune"
+            />
+          )}
+        </div>
+      )}
+
       {/* Actions */}
       <div className="space-y-2">
         <button
@@ -320,6 +428,11 @@ export default function ConfigPanel({ config, onChange, onRun, onCompare, onSwee
         <button onClick={onSweep} disabled={loading} className="btn-secondary w-full">
           Sweep k (1 → {config.k})
         </button>
+        {config.spec && onAutotune && (
+          <button onClick={onAutotune} disabled={loading} className="btn-secondary w-full">
+            Autotune (k + params)
+          </button>
+        )}
       </div>
     </aside>
   )

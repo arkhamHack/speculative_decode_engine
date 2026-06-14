@@ -116,6 +116,9 @@ struct GenerationParams {
     int    max_new_tokens;
     int    spec_k;         // draft tokens per speculation round
     bool   use_megakernel; // false = multi-kernel loop, true = persistent megakernel
+    // Self-speculative: draft = first n_draft_layers of target; same weight tensors.
+    bool   self_speculative = false;
+    int    n_draft_layers   = 0;   // 0 = use draft_model.cfg.n_layers
     // EOS token id from the HF tokenizer (-1 = disabled, generation always runs to max_new_tokens)
     int    eos_token      = -1;
     //

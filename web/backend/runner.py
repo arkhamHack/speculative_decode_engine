@@ -269,7 +269,17 @@ def parse_output(stdout: str) -> dict:
 
 # ── Mock data (when exe not found) ────────────────────────────────────────────
 
-def _mock_result(mode: str, spec: bool, max_tokens: int, k: int, seed: int) -> dict:
+def _mock_result(
+    mode: str,
+    spec: bool,
+    max_tokens: int,
+    k: int,
+    seed: int,
+    *,
+    draft_temp: float = 1.0,
+    spec_mode: str = "two_model",
+    draft_layers: int = 2,
+) -> dict:
     """Return plausible fake data so the UI works without a compiled binary."""
     rng = random.Random(seed)
 
@@ -277,7 +287,10 @@ def _mock_result(mode: str, spec: bool, max_tokens: int, k: int, seed: int) -> d
     base_ms = (max_tokens / base_tps) * 1000
 
     if spec:
-        accept_rate = rng.uniform(0.55, 0.85)
+        if spec_mode == "self_spec":
+            accept_rate = rng.uniform(0.72, 0.92)
+        else:
+            accept_rate = rng.uniform(0.55, 0.85)
         speedup = (1 - accept_rate ** (k + 1)) / ((1 - accept_rate) * (k * 0.05 + 1))
         speedup = max(1.0, min(speedup, 2.5))
         spec_ms = base_ms / speedup
@@ -304,6 +317,8 @@ def _mock_result(mode: str, spec: bool, max_tokens: int, k: int, seed: int) -> d
     return {
         "device": "NVIDIA GeForce RTX 3050 (mock)",
         "mode": mode,
+        "spec_mode": spec_mode,
+        "draft_layers": draft_layers,
         "baseline_tokens": tokens,
         "baseline_n": max_tokens,
         "baseline_ms": round(base_ms, 2),
@@ -342,6 +357,8 @@ def run_benchmark(
     tokenizer_model: Optional[str] = None,
     prompt_text: Optional[str] = None,
     use_chat_template: bool = True,
+    spec_mode: str = "two_model",
+    draft_layers: int = 2,
     # Stochastic speculative decoding (Leviathan et al. exact algorithm)
     stochastic: bool = False,
     draft_temp: float = 1.0,
@@ -354,22 +371,54 @@ def run_benchmark(
     exe = find_exe()
     if exe is None:
         time.sleep(0.4)  # simulate latency
-        return _mock_result(mode, spec, max_tokens, k, seed)
+        return _mock_result(
+            mode, spec, max_tokens, k, seed,
+            draft_temp=draft_temp,
+            spec_mode=spec_mode,
+            draft_layers=draft_layers,
+        )
 
     tmp_rm: list[Path] = []
+    self_spec = spec_mode == "self_spec"
+
+    def _append_stochastic_flags(cmd: list[str]) -> None:
+        if stochastic:
+            cmd.append("--stochastic-spec")
+            cmd.append(f"--draft-temp={draft_temp:.4f}")
+            cmd.append(f"--spec-seed={spec_seed}")
+            if adaptive_draft_temp:
+                cmd.append("--adaptive-draft-temp")
+                cmd.append(f"--adapt-accept={adapt_accept:.4f}")
+                cmd.append(f"--adapt-gain={adapt_gain:.4f}")
+                cmd.append(f"--adapt-ewma={adapt_ewma:.4f}")
+
+    def _append_self_spec_flags(cmd: list[str]) -> None:
+        if self_spec:
+            cmd.append("--self-spec")
+            cmd.append(f"--draft-layers={draft_layers}")
 
     try:
         if production:
-            if not draft_path or not target_path or not tokenizer_model or prompt_text is None:
+            if self_spec:
+                if not target_path or not tokenizer_model or prompt_text is None:
+                    return {
+                        "error": "production self-spec requires target_path, tokenizer_model, and prompt_text",
+                    }
+            elif not draft_path or not target_path or not tokenizer_model or prompt_text is None:
                 return {
                     "error": "production mode requires draft_path, target_path, tokenizer_model, and prompt_text",
                 }
-            draft = resolve_user_path(draft_path)
-            target = resolve_user_path(target_path)
-            if not draft.is_file():
-                return {"error": f"Draft weights not found: {draft}"}
+
+            if self_spec:
+                target = resolve_user_path(target_path)
+                draft = target
+            else:
+                draft = resolve_user_path(draft_path)
+                target = resolve_user_path(target_path)
             if not target.is_file():
                 return {"error": f"Target weights not found: {target}"}
+            if not self_spec and not draft.is_file():
+                return {"error": f"Draft weights not found: {draft}"}
 
             fd, prompt_tok_path = tempfile.mkstemp(suffix=".tok", prefix="sd_prompt_")
             os.close(fd)
@@ -400,17 +449,10 @@ def run_benchmark(
                 f"--max-tokens={max_tokens}",
                 f"--k={k}",
             ]
+            _append_self_spec_flags(cmd)
             if eos_token_id >= 0 and exe_supports_eos_token(exe):
                 cmd.append(f"--eos-token={eos_token_id}")
-            if stochastic:
-                cmd.append("--stochastic-spec")
-                cmd.append(f"--draft-temp={draft_temp:.4f}")
-                cmd.append(f"--spec-seed={spec_seed}")
-                if adaptive_draft_temp:
-                    cmd.append("--adaptive-draft-temp")
-                    cmd.append(f"--adapt-accept={adapt_accept:.4f}")
-                    cmd.append(f"--adapt-gain={adapt_gain:.4f}")
-                    cmd.append(f"--adapt-ewma={adapt_ewma:.4f}")
+            _append_stochastic_flags(cmd)
             timeout_sec = 600
         else:
             cmd = [
@@ -421,15 +463,8 @@ def run_benchmark(
                 f"--seed={seed}",
                 f"--prompt-len={prompt_len}",
             ]
-            if stochastic:
-                cmd.append("--stochastic-spec")
-                cmd.append(f"--draft-temp={draft_temp:.4f}")
-                cmd.append(f"--spec-seed={spec_seed}")
-                if adaptive_draft_temp:
-                    cmd.append("--adaptive-draft-temp")
-                    cmd.append(f"--adapt-accept={adapt_accept:.4f}")
-                    cmd.append(f"--adapt-gain={adapt_gain:.4f}")
-                    cmd.append(f"--adapt-ewma={adapt_ewma:.4f}")
+            _append_self_spec_flags(cmd)
+            _append_stochastic_flags(cmd)
             timeout_sec = 120
 
         proc = subprocess.run(
@@ -447,6 +482,8 @@ def run_benchmark(
         result = parse_output(stdout)
         result["production"] = bool(production)
         result["stochastic"] = bool(stochastic)
+        result["spec_mode"] = spec_mode
+        result["draft_layers"] = draft_layers
         if production and prompt_text is not None:
             result["prompt_preview"] = (
                 (prompt_text[:200] + "…")

@@ -180,6 +180,49 @@ __global__ void stochastic_draft_forward_sample_dptr_kernel(
     __syncthreads();
 }
 
+// Self-spec stochastic draft: same as above but saves prefix activation for verify.
+__global__ void stochastic_draft_forward_sample_save_dptr_kernel(
+        ModelWeights target_model,
+        KVCache kv,
+        const int* d_token_id,
+        int seq_len,
+        int n_prefix_layers,
+        float temperature,
+        curandState* rng,
+        float* g_logits,
+        float* g_saved_hidden,
+        int* sampled_id,
+        float* sampled_q_prob) {
+    extern __shared__ float shared[];
+
+    int token_id = d_token_id[0];
+    int d = target_model.cfg.d_model;
+    int V = target_model.cfg.vocab_size;
+    float* hidden = shared;
+    float* smem   = shared + d;
+
+    model_forward_draft_logits(target_model, kv, token_id, seq_len,
+                               n_prefix_layers, hidden, g_logits,
+                               g_saved_hidden, smem);
+    __syncthreads();
+
+    float* softmax_scratch = hidden;
+    logits_inplace_softmax_temp(g_logits, V, temperature, softmax_scratch);
+
+    if (threadIdx.x == 0) {
+        float u      = curand_uniform(rng);
+        float cdf    = 0.f;
+        int   choice = V - 1;
+        for (int i = 0; i < V; i++) {
+            cdf += g_logits[i];
+            if (u <= cdf || i == V - 1) { choice = i; break; }
+        }
+        sampled_id[0]     = choice;
+        sampled_q_prob[0] = g_logits[choice];
+    }
+    __syncthreads();
+}
+
 // Forward target, then softmax p(idx) without destroying raw logits buffer.
 __global__ void target_forward_prob_mass_kernel(ModelWeights target_model,
                                                 KVCache kv,
@@ -246,6 +289,47 @@ __global__ void target_fwd_prob_and_accept_kernel(
 
     // logits_softmax_prob_at_global is read-only; raw logits are preserved for
     // corrected_sample_adjusted_logits_kernel that may follow a rejection.
+    float* softmax_reduction = hidden;
+    float pm = logits_softmax_prob_at_global(g_logits, V, draft_token, 1.f, softmax_reduction);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float q_eff = fmaxf(q_mass, 1e-36f);
+        float cap   = fminf(1.f, pm / q_eff);
+        accepted_flag[0] = (curand_uniform(rng) <= cap) ? 1 : 0;
+    }
+}
+
+// Self-spec verify: reuse draft-saved activation when use_saved != 0.
+__global__ void target_fwd_prob_and_accept_selfspec_kernel(
+        ModelWeights target_model,
+        KVCache kv,
+        int token_id, int seq_len,
+        int layer_start,
+        const float* saved_hidden,
+        int use_saved,
+        int draft_token,
+        float q_mass,
+        float* g_logits,
+        curandState* rng,
+        int* accepted_flag)
+{
+    extern __shared__ float shared[];
+    int d = target_model.cfg.d_model;
+    int V = target_model.cfg.vocab_size;
+    float* hidden   = shared;
+    float* lay_smem = shared + d;
+
+    if (use_saved)
+        model_forward_verify_from_hidden_logits(
+            target_model, kv, saved_hidden, layer_start, seq_len,
+            hidden, g_logits, lay_smem);
+    else
+        model_forward_verify_anchor_logits(
+            target_model, kv, token_id, layer_start, seq_len,
+            hidden, g_logits, lay_smem);
+    __syncthreads();
+
     float* softmax_reduction = hidden;
     float pm = logits_softmax_prob_at_global(g_logits, V, draft_token, 1.f, softmax_reduction);
     __syncthreads();
@@ -965,6 +1049,138 @@ __global__ void batch_target_verify_kernel(
     }
 }
 
+// Prefix-only save for the verify bonus slot (position k in a k+1 batch).
+__global__ void selfspec_bonus_prefix_save_kernel(
+        ModelWeights target_model, KVCache kv,
+        int token_id, int seq_len, int n_prefix_layers,
+        float* g_saved_hidden) {
+    extern __shared__ float shared[];
+    int d = target_model.cfg.d_model;
+    float* hidden = shared;
+    float* smem   = shared + d;
+    model_forward_draft_prefix_save(
+        target_model, kv, token_id, seq_len, n_prefix_layers,
+        hidden, g_saved_hidden, smem);
+}
+
+__global__ void selfspec_bonus_prefix_save_dptr_kernel(
+        ModelWeights target_model, KVCache kv,
+        const int* d_token_id, int seq_len, int n_prefix_layers,
+        float* g_saved_hidden) {
+    extern __shared__ float shared[];
+    int token_id = d_token_id[0];
+    int d = target_model.cfg.d_model;
+    float* hidden = shared;
+    float* smem   = shared + d;
+    model_forward_draft_prefix_save(
+        target_model, kv, token_id, seq_len, n_prefix_layers,
+        hidden, g_saved_hidden, smem);
+}
+
+// Self-spec draft: k tokens + bonus prefix save, saving post-prefix activations.
+__global__ void batch_draft_selfspec_kernel(
+        ModelWeights target_model, KVCache kv,
+        int first_token, int k, int start_seq_len,
+        int n_prefix_layers,
+        float* g_logits,
+        float* g_saved_hiddens,  // [(k + 1) * d_model]
+        int*   out_tokens)
+{
+    extern __shared__ float shared[];
+    int d      = target_model.cfg.d_model;
+    int V      = target_model.cfg.vocab_size;
+    float* hidden = shared;
+    float* smem   = shared + d;
+
+    __shared__ int s_cur;
+    if (threadIdx.x == 0) s_cur = first_token;
+    __syncthreads();
+
+    for (int i = 0; i < k; i++) {
+        model_forward_draft_logits(
+            target_model, kv, s_cur, start_seq_len + i,
+            n_prefix_layers, hidden, g_logits,
+            g_saved_hiddens + (size_t)i * d, smem);
+        int nxt = global_argmax(g_logits, V, smem);
+        if (threadIdx.x == 0) { out_tokens[i] = nxt; s_cur = nxt; }
+        __syncthreads();
+    }
+
+    if (k > 0) {
+        model_forward_draft_prefix_save(
+            target_model, kv, s_cur, start_seq_len + k,
+            n_prefix_layers, hidden,
+            g_saved_hiddens + (size_t)k * d, smem);
+    }
+}
+
+// Self-spec verify: all positions load saved[b] and run suffix layers.
+__global__ void batch_target_verify_selfspec_kernel(
+        ModelWeights model, KVCache kv,
+        const int* verify_tokens, int batch_size, int start_seq_len,
+        int layer_start,
+        const float* g_saved_hiddens,  // [batch_size * d_model]
+        float* g_hidden, float* g_work,
+        float* g_logits_batch,         // [batch_size * vocab_size]
+        int*   out_tokens)
+{
+    extern __shared__ float shared[];
+    float* smem = shared;
+
+    model_batch_forward_selfspec_verify_logits(
+        model, kv, verify_tokens, start_seq_len, batch_size, layer_start,
+        g_saved_hiddens, g_hidden, g_work, g_logits_batch, smem);
+
+    int V = model.cfg.vocab_size;
+    for (int i = 0; i < batch_size; i++) {
+        int nxt = global_argmax(g_logits_batch + (size_t)i * V, V, smem);
+        if (threadIdx.x == 0) out_tokens[i] = nxt;
+        __syncthreads();
+    }
+}
+
+// Cooperative self-spec verify: one block per token; suffix from saved[b].
+__global__ void batch_target_verify_coop_selfspec_kernel(
+        ModelWeights model, KVCache kv,
+        const int* verify_tokens,
+        int batch_size,
+        int start_seq_len,
+        int layer_start,
+        const float* g_saved_hiddens,  // [batch_size * d_model]
+        float* g_logits_batch,
+        int* out_tokens)
+{
+    namespace cg = cooperative_groups;
+    auto grid = cg::this_grid();
+
+    int b = (int)blockIdx.x;
+    if (b >= batch_size) return;
+
+    extern __shared__ float shared[];
+    int d = model.cfg.d_model;
+    float* hidden = shared;
+    float* smem   = shared + d;
+
+    int seq_pos = start_seq_len + b;
+
+    const float* src = g_saved_hiddens + (size_t)b * d;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        hidden[i] = src[i];
+    __syncthreads();
+
+    for (int l = layer_start; l < model.cfg.n_layers; l++) {
+        model_layer_kv_phase(model, l, hidden, kv, seq_pos, smem);
+        grid.sync();
+        model_layer_attn_mlp_phase(model, l, hidden, kv, seq_pos, smem);
+        grid.sync();
+    }
+
+    float* my_logits = g_logits_batch + (size_t)b * model.cfg.vocab_size;
+    model_output(model, hidden, my_logits, smem);
+    int next = global_argmax(my_logits, model.cfg.vocab_size, smem);
+    if (threadIdx.x == 0) out_tokens[b] = next;
+}
+
 // ---- Baseline (multi-kernel) ----
 
 // Forward declaration — full definition appears later in this file.
@@ -1284,31 +1500,53 @@ void multikernel_speculative(const ModelWeights& draft_model,
     CUDA_CHECK(cudaMalloc(&d_output, MAX_SEQ_LEN * sizeof(int)));
 
     kv_cache_reset(draft_kv);
-    kv_cache_reset(target_kv);
+    if (!params.self_speculative)
+        kv_cache_reset(target_kv);
 
     int draft_seq  = 0;
     int target_seq = 0;
 
-    // ---- Prefill: draft (stream[0]) and target (stream[1]) run in parallel ----
-    // Each prompt token still has a sequential dependency within each model
-    // (token i+1 needs KV from token i), but draft[i] and target[i] are
-    // independent of each other and can run concurrently.
-    //
-    // When the model is large enough we further overlap Q‖K‖V and gate‖up
-    // projections inside each token step using intra-layer stream overlap.
-    // Draft  uses streams[0](main) / streams[2](K) / streams[3](V+up).
-    // Target uses streams[1](main) / streams[2](K) / streams[3](V+up).
-    // Since draft and target run sequentially within each prompt position
-    // (gated by the cross-stream sync events), sharing streams[2/3] is safe.
-    cudaStream_t stream_d = (eng != nullptr) ? eng->streams[0] : nullptr;
-    cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
+    // ---- Prefill ----
+    // Self-spec uses one shared cache: target full prefill only (draft layers are
+    // a prefix of the same KV entries written during verify each round).
+    if (params.self_speculative) {
+        cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
+        const bool use_ovl_target = (eng != nullptr &&
+                                     target_model.cfg.d_model >= OVERLAP_MIN_D);
+        const bool use_coop_tgt = use_coop_target;
+        for (int i = 0; i < prompt_len; i++) {
+            if (use_ovl_target) {
+                launch_prefill_overlapped(
+                    target_model, target_kv, h_prompt[i], target_seq,
+                    eng->d_ovl_buf[0], g_logits_target, d_next, *eng,
+                    eng->streams[1], eng->streams[2], eng->streams[3]);
+            } else if (use_coop_tgt) {
+                launch_cooperative_decode_step(
+                    target_model, target_kv, h_prompt[i], target_seq,
+                    eng->d_coop_hidden, eng->d_coop_scratch,
+                    g_logits_target, d_next, eng->max_coop_blocks, stream_t);
+            } else {
+                single_token_decode_kernel<<<1, BLOCK_THREADS, target_smem, stream_t>>>(
+                    target_model, target_kv, h_prompt[i], target_seq,
+                    g_logits_target, d_next);
+            }
+            target_seq++;
+            set_seq_len_kernel<<<1, 1, 0, stream_t>>>(target_kv.seq_len, target_seq);
+        }
+        if (eng != nullptr)
+            CUDA_CHECK(cudaStreamSynchronize(stream_t));
+        draft_seq = target_seq;
+    } else {
+        // ---- Prefill: draft (stream[0]) and target (stream[1]) run in parallel ----
+        cudaStream_t stream_d = (eng != nullptr) ? eng->streams[0] : nullptr;
+        cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
 
-    const bool use_ovl_draft  = (eng != nullptr &&
-                                  draft_model.cfg.d_model  >= OVERLAP_MIN_D);
-    const bool use_ovl_target = (eng != nullptr &&
-                                  target_model.cfg.d_model >= OVERLAP_MIN_D);
+        const bool use_ovl_draft  = (eng != nullptr &&
+                                      draft_model.cfg.d_model  >= OVERLAP_MIN_D);
+        const bool use_ovl_target = (eng != nullptr &&
+                                      target_model.cfg.d_model >= OVERLAP_MIN_D);
 
-    for (int i = 0; i < prompt_len; i++) {
+        for (int i = 0; i < prompt_len; i++) {
         // Draft prefill on stream_d; uses d_ovl_buf[1] / d_coop_hidden2
         // (separate buffer from target to avoid aliasing).
         if (use_ovl_draft) {
@@ -1388,6 +1626,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
             CUDA_CHECK(cudaStreamSynchronize(eng->streams[3]));
         }
     }
+    }
 
     int last_token;
     CUDA_CHECK(cudaMemcpy(&last_token, d_next, sizeof(int),
@@ -1425,12 +1664,18 @@ void multikernel_speculative(const ModelWeights& draft_model,
                                              draft_smem);
         cuda_configure_kernel_dynamic_smem(stochastic_draft_forward_sample_dptr_kernel,
                                              draft_smem);
+        if (params.self_speculative)
+            cuda_configure_kernel_dynamic_smem(
+                stochastic_draft_forward_sample_save_dptr_kernel, draft_smem);
         cuda_configure_kernel_dynamic_smem(single_token_forward_logits_kernel,
                                            max_decode_smem);
         cuda_configure_kernel_dynamic_smem(target_forward_prob_mass_kernel,
                                            target_smem);
         cuda_configure_kernel_dynamic_smem(target_fwd_prob_and_accept_kernel,
                                            target_smem);
+        if (params.self_speculative)
+            cuda_configure_kernel_dynamic_smem(
+                target_fwd_prob_and_accept_selfspec_kernel, target_smem);
         cuda_configure_kernel_dynamic_smem(softmax_sample_temperature_kernel,
                                            0);
         cuda_configure_kernel_dynamic_smem(corrected_sample_adjusted_logits_kernel,
@@ -1464,6 +1709,14 @@ void multikernel_speculative(const ModelWeights& draft_model,
         int*   d_draft_tokens_dev = nullptr;
         float* d_q_probs_dev      = nullptr;
         int*   d_ctx_seed         = nullptr;   // bootstrap: device copy of last_token
+        float* d_selfspec_hiddens_local = nullptr;
+        float* d_selfspec_hiddens = (eng != nullptr) ? eng->d_selfspec_hiddens : nullptr;
+        if (params.self_speculative && d_selfspec_hiddens == nullptr) {
+            CUDA_CHECK(cudaMalloc(&d_selfspec_hiddens_local,
+                                  (size_t)(k + 1) * target_model.cfg.d_model *
+                                      sizeof(float)));
+            d_selfspec_hiddens = d_selfspec_hiddens_local;
+        }
         CUDA_CHECK(cudaMalloc(&d_draft_tokens_dev, (size_t)k * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_q_probs_dev,      (size_t)k * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_ctx_seed,          sizeof(int)));
@@ -1484,15 +1737,34 @@ void multikernel_speculative(const ModelWeights& draft_model,
             const int* d_ctx_ptr = d_ctx_seed;
 
             for (int di = 0; di < current_k; di++) {
-                stochastic_draft_forward_sample_dptr_kernel
-                    <<<1, BLOCK_THREADS, draft_smem>>>(
-                        draft_model, draft_kv, d_ctx_ptr, draft_seq,
-                        draft_temp_dyn, d_rng, g_logits_draft,
-                        d_draft_tokens_dev + di, d_q_probs_dev + di);
+                if (params.self_speculative) {
+                    stochastic_draft_forward_sample_save_dptr_kernel
+                        <<<1, BLOCK_THREADS, draft_smem>>>(
+                            target_model, draft_kv, d_ctx_ptr, draft_seq,
+                            params.n_draft_layers,
+                            draft_temp_dyn, d_rng, g_logits_draft,
+                            d_selfspec_hiddens +
+                                (size_t)di * target_model.cfg.d_model,
+                            d_draft_tokens_dev + di, d_q_probs_dev + di);
+                } else {
+                    stochastic_draft_forward_sample_dptr_kernel
+                        <<<1, BLOCK_THREADS, draft_smem>>>(
+                            draft_model, draft_kv, d_ctx_ptr, draft_seq,
+                            draft_temp_dyn, d_rng, g_logits_draft,
+                            d_draft_tokens_dev + di, d_q_probs_dev + di);
+                }
                 // Chain: next step reads the token this step just wrote on device.
                 d_ctx_ptr = d_draft_tokens_dev + di;
                 draft_seq++;
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            }
+            if (params.self_speculative && current_k > 0) {
+                selfspec_bonus_prefix_save_dptr_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                    target_model, draft_kv,
+                    d_draft_tokens_dev + (current_k - 1), draft_seq,
+                    params.n_draft_layers,
+                    d_selfspec_hiddens +
+                        (size_t)current_k * target_model.cfg.d_model);
             }
             // One sync + one batch copy for all k draft tokens and probabilities.
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -1511,13 +1783,23 @@ void multikernel_speculative(const ModelWeights& draft_model,
             for (int vi = 0; vi < current_k; vi++) {
                 int inp = (vi == 0) ? last_token : h_draft_tokens[vi - 1];
 
-                // Fused target forward + acceptance gate: one launch, one sync,
-                // one memcpy per verification step (was two launches + two syncs).
-                target_fwd_prob_and_accept_kernel
-                    <<<1, BLOCK_THREADS, target_smem>>>(
-                        target_model, target_kv, inp, target_roll,
-                        h_draft_tokens[vi], h_q_probs[vi],
-                        g_logits_target, d_rng, d_accept);
+                if (params.self_speculative) {
+                    target_fwd_prob_and_accept_selfspec_kernel
+                        <<<1, BLOCK_THREADS, target_smem>>>(
+                            target_model, target_kv, inp, target_roll,
+                            params.n_draft_layers,
+                            d_selfspec_hiddens +
+                                (size_t)vi * target_model.cfg.d_model,
+                            1,
+                            h_draft_tokens[vi], h_q_probs[vi],
+                            g_logits_target, d_rng, d_accept);
+                } else {
+                    target_fwd_prob_and_accept_kernel
+                        <<<1, BLOCK_THREADS, target_smem>>>(
+                            target_model, target_kv, inp, target_roll,
+                            h_draft_tokens[vi], h_q_probs[vi],
+                            g_logits_target, d_rng, d_accept);
+                }
                 CUDA_CHECK(cudaDeviceSynchronize());
 
                 int acc_flag = 0;
@@ -1533,10 +1815,15 @@ void multikernel_speculative(const ModelWeights& draft_model,
                 }
 
                 broke_early = true;
-                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len,
-                                             draft_seq_save + vi);
-                set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len,
-                                             target_seq_save + vi);
+                if (params.self_speculative) {
+                    set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len,
+                                                 target_seq_save + vi);
+                } else {
+                    set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len,
+                                                 draft_seq_save + vi);
+                    set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len,
+                                                 target_seq_save + vi);
+                }
 
                 single_token_forward_logits_kernel
                     <<<1, BLOCK_THREADS, draft_smem>>>(
@@ -1591,26 +1878,30 @@ void multikernel_speculative(const ModelWeights& draft_model,
             target_seq = target_seq_save + n_accept_round + 1;
             set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, target_seq);
 
-            draft_seq = draft_seq_save + n_accept_round;
-            set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            if (params.self_speculative) {
+                draft_seq = target_seq;
+            } else {
+                draft_seq = draft_seq_save + n_accept_round;
+                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
 
-            if (n_accept_round == current_k) {
+                if (n_accept_round == current_k) {
+                    cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
+                                                       draft_smem);
+                    single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                        draft_model, draft_kv, h_draft_tokens[current_k - 1],
+                        draft_seq, g_logits_draft, d_next);
+                    draft_seq++;
+                    set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+                }
+
                 cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
                                                    draft_smem);
                 single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                    draft_model, draft_kv, h_draft_tokens[current_k - 1],
-                    draft_seq, g_logits_draft, d_next);
+                    draft_model, draft_kv, last_token, draft_seq, g_logits_draft,
+                    d_next);
                 draft_seq++;
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
             }
-
-            cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
-                                               draft_smem);
-            single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                draft_model, draft_kv, last_token, draft_seq, g_logits_draft,
-                d_next);
-            draft_seq++;
-            set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
             CUDA_CHECK(cudaDeviceSynchronize());
 
             if (params.adaptive_draft_temperature && current_k > 0) {
@@ -1641,6 +1932,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
         cudaFree(d_ctx_seed);
         cudaFree(d_q_probs_dev);
         cudaFree(d_draft_tokens_dev);
+        if (d_selfspec_hiddens_local) cudaFree(d_selfspec_hiddens_local);
         cudaFree(d_corr_work);
         cudaFree(d_accept);
         cudaFree(d_q_mass_out);
@@ -1671,16 +1963,42 @@ void multikernel_speculative(const ModelWeights& draft_model,
     CUDA_CHECK(cudaMalloc(&d_batch_verify_in,  (size_t)(k + 1) * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_batch_verify_out, (size_t)(k + 1) * sizeof(int)));
 
+    float* d_selfspec_hiddens_local = nullptr;
+    float* d_selfspec_hiddens = (eng != nullptr) ? eng->d_selfspec_hiddens : nullptr;
+    if (params.self_speculative && d_selfspec_hiddens == nullptr) {
+        CUDA_CHECK(cudaMalloc(&d_selfspec_hiddens_local,
+                              (size_t)(k + 1) * target_model.cfg.d_model *
+                                  sizeof(float)));
+        d_selfspec_hiddens = d_selfspec_hiddens_local;
+    }
+
+    float* g_batch_hidden = nullptr;
+    float* g_batch_work   = nullptr;
+
     // Configure batch kernels once before the loop
     cuda_configure_kernel_dynamic_smem(batch_draft_greedy_kernel, draft_smem);
     if (!use_coop_verify)
         cuda_configure_kernel_dynamic_smem(batch_target_verify_kernel, target_smem);
     if (use_coop_verify)
         cuda_configure_kernel_dynamic_smem(batch_target_verify_coop_kernel, target_smem);
+    if (params.self_speculative) {
+        cuda_configure_kernel_dynamic_smem(batch_draft_selfspec_kernel, draft_smem);
+        cuda_configure_kernel_dynamic_smem(batch_target_verify_selfspec_kernel,
+                                           target_smem);
+        if (use_coop_verify)
+            cuda_configure_kernel_dynamic_smem(batch_target_verify_coop_selfspec_kernel,
+                                               target_smem);
+        int max_B = k + 1;
+        int d_t   = target_model.cfg.d_model;
+        CUDA_CHECK(cudaMalloc(&g_batch_hidden,
+                              (size_t)max_B * d_t * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_batch_work,
+                              (size_t)(7 * d_t + MLP_FF_TILE) * max_B * sizeof(float)));
+    }
 
-    // Pre-allocate a logits buffer for cooperative verify ([MAX_VERIFY_BATCH × vocab_size])
+    // Batched verify logits (cooperative path or self-spec sequential batched verify)
     float* g_logits_verify_batch = nullptr;
-    if (use_coop_verify)
+    if (use_coop_verify || params.self_speculative)
         CUDA_CHECK(cudaMalloc(&g_logits_verify_batch,
                               (size_t)MAX_VERIFY_BATCH * target_model.cfg.vocab_size
                               * sizeof(float)));
@@ -1695,11 +2013,21 @@ void multikernel_speculative(const ModelWeights& draft_model,
         total_proposed += current_k;
 
         // ---- Draft phase: one batched kernel (k separate launches → 1) ----
-        batch_draft_greedy_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-            draft_model, draft_kv, last_token, current_k, draft_seq,
-            g_logits_draft, d_batch_draft);
+        if (params.self_speculative) {
+            batch_draft_selfspec_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                target_model, draft_kv, last_token, current_k, draft_seq,
+                params.n_draft_layers,
+                g_logits_draft, d_selfspec_hiddens, d_batch_draft);
+        } else {
+            batch_draft_greedy_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                draft_model, draft_kv, last_token, current_k, draft_seq,
+                g_logits_draft, d_batch_draft);
+        }
         draft_seq += current_k;
-        set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+        if (!params.self_speculative) {
+            set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+        }
+        // Shared KV: leave device seq_len at target_seq until verify completes.
         // D2H memcpy provides implicit sync; no separate DeviceSync needed
         CUDA_CHECK(cudaMemcpy(h_draft_tokens, d_batch_draft,
                               current_k * sizeof(int), cudaMemcpyDeviceToHost));
@@ -1711,7 +2039,33 @@ void multikernel_speculative(const ModelWeights& draft_model,
         CUDA_CHECK(cudaMemcpy(d_batch_verify_in, h_verify_tokens,
                               batch_size * sizeof(int), cudaMemcpyHostToDevice));
 
-        if (use_coop_verify) {
+        if (params.self_speculative) {
+            int n_dl = params.n_draft_layers;
+            if (use_coop_verify) {
+                void* coop_args[] = {
+                    (void*)&target_model,
+                    (void*)&target_kv,
+                    (void*)&d_batch_verify_in,
+                    (void*)&batch_size,
+                    (void*)&target_seq,
+                    (void*)&n_dl,
+                    (void*)&d_selfspec_hiddens,
+                    (void*)&g_logits_verify_batch,
+                    (void*)&d_batch_verify_out
+                };
+                CUDA_CHECK(cudaLaunchCooperativeKernel(
+                    (void*)batch_target_verify_coop_selfspec_kernel,
+                    dim3(batch_size), dim3(BLOCK_THREADS),
+                    coop_args, target_smem, nullptr));
+                CUDA_CHECK(cudaDeviceSynchronize());
+            } else {
+                batch_target_verify_selfspec_kernel<<<1, BLOCK_THREADS, target_smem>>>(
+                    target_model, target_kv, d_batch_verify_in, batch_size,
+                    target_seq, n_dl, d_selfspec_hiddens,
+                    g_batch_hidden, g_batch_work, g_logits_verify_batch,
+                    d_batch_verify_out);
+            }
+        } else if (use_coop_verify) {
             // Cooperative: k+1 blocks run in parallel, one block per token
             void* coop_args[] = {
                 (void*)&target_model,
@@ -1765,47 +2119,47 @@ void multikernel_speculative(const ModelWeights& draft_model,
         }
         last_token = bonus;
 
-        // Rollback caches to the accepted prefix
+        // Rollback cache to the accepted prefix
         target_seq = target_seq_save + n_accepted + 1;
         set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, target_seq);
 
-        draft_seq = draft_seq_save + n_accepted;
-        set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
-
-        // When ALL k drafts were accepted, draft[k-1] was only a prediction —
-        // its K/V was never written.  One extra forward fills that slot.
-        // After this draft_seq == target_seq; the bonus-sync below must NOT
-        // run, or draft_seq would overshoot target_seq by 1 and corrupt RoPE
-        // positions in every subsequent round (accumulating alignment errors).
-        if (n_accepted == current_k) {
-            if (use_coop_draft) {
-                launch_cooperative_decode_step(
-                    draft_model, draft_kv, h_draft_tokens[current_k - 1],
-                    draft_seq, eng->d_coop_hidden2, eng->d_coop_scratch2,
-                    g_logits_draft, d_next, eng->max_coop_blocks);
-            } else {
-                single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                    draft_model, draft_kv, h_draft_tokens[current_k - 1],
-                    draft_seq, g_logits_draft, d_next);
-            }
-            draft_seq++;
-            set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
-            // draft_seq == target_seq — do NOT run the bonus sync.
+        if (params.self_speculative) {
+            // Shared KV: verify wrote full-depth K/V at each position; no draft-only sync.
+            draft_seq = target_seq;
         } else {
-            // Partial accept: write bonus token's K/V at the rollback position
-            // so that both caches are aligned before the next spec round.
-            if (use_coop_draft) {
-                launch_cooperative_decode_step(
-                    draft_model, draft_kv, last_token, draft_seq,
-                    eng->d_coop_hidden2, eng->d_coop_scratch2,
-                    g_logits_draft, d_next, eng->max_coop_blocks);
-            } else {
-                single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                    draft_model, draft_kv, last_token, draft_seq,
-                    g_logits_draft, d_next);
-            }
-            draft_seq++;
+            draft_seq = draft_seq_save + n_accepted;
             set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+
+            // When ALL k drafts were accepted, draft[k-1] was only a prediction —
+            // its K/V was never written.  One extra forward fills that slot.
+            if (n_accepted == current_k) {
+                if (use_coop_draft) {
+                    launch_cooperative_decode_step(
+                        draft_model, draft_kv, h_draft_tokens[current_k - 1],
+                        draft_seq, eng->d_coop_hidden2, eng->d_coop_scratch2,
+                        g_logits_draft, d_next, eng->max_coop_blocks);
+                } else {
+                    single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                        draft_model, draft_kv, h_draft_tokens[current_k - 1],
+                        draft_seq, g_logits_draft, d_next);
+                }
+                draft_seq++;
+                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            } else {
+                // Partial accept: write bonus token's K/V at the rollback position.
+                if (use_coop_draft) {
+                    launch_cooperative_decode_step(
+                        draft_model, draft_kv, last_token, draft_seq,
+                        eng->d_coop_hidden2, eng->d_coop_scratch2,
+                        g_logits_draft, d_next, eng->max_coop_blocks);
+                } else {
+                    single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                        draft_model, draft_kv, last_token, draft_seq,
+                        g_logits_draft, d_next);
+                }
+                draft_seq++;
+                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -1818,6 +2172,9 @@ void multikernel_speculative(const ModelWeights& draft_model,
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (g_logits_verify_batch) cudaFree(g_logits_verify_batch);
+    if (g_batch_hidden) cudaFree(g_batch_hidden);
+    if (g_batch_work) cudaFree(g_batch_work);
+    if (d_selfspec_hiddens_local) cudaFree(d_selfspec_hiddens_local);
     delete[] h_draft_tokens;
     delete[] h_target_tokens;
     delete[] h_verify_tokens;
@@ -1977,7 +2334,8 @@ __global__ void megakernel_speculative_kernel(
         float* g_batch_hidden,
         float* g_batch_work,
         float* g_batch_logits,
-        GenerationResult* result, int eos_token) {
+        float* g_selfspec_hiddens,
+        GenerationResult* result, int eos_token, bool shared_kv) {
     const ModelWeights& draft_model  = *p_draft_model;
     const ModelWeights& target_model = *p_target_model;
     KVCache&            draft_kv     = *p_draft_kv;
@@ -2008,7 +2366,20 @@ __global__ void megakernel_speculative_kernel(
     }
     __syncthreads();
 
-    // ---- Prefill both models ----
+    // ---- Prefill ----
+    if (shared_kv) {
+        for (int i = 0; i < prompt_len; i++) {
+            int next_t = model_forward(target_model, target_kv, prompt[i],
+                                       s_target_seq, hidden, g_logits, smem);
+            if (tid == 0) {
+                s_last_token = next_t;
+                s_target_seq++;
+                s_draft_seq = s_target_seq;
+                *target_kv.seq_len = s_target_seq;
+            }
+            __syncthreads();
+        }
+    } else {
     for (int i = 0; i < prompt_len; i++) {
         model_forward(draft_model, draft_kv, prompt[i],
                       s_draft_seq, hidden, g_logits, smem);
@@ -2023,6 +2394,7 @@ __global__ void megakernel_speculative_kernel(
             *target_kv.seq_len = s_target_seq;
         }
         __syncthreads();
+    }
     }
 
     // Write prefill output (matches baseline token[0])
@@ -2065,14 +2437,33 @@ __global__ void megakernel_speculative_kernel(
         __syncthreads();
 
         for (int di = 0; di < current_k; di++) {
-            int next = model_forward(draft_model, draft_kv, s_draft_input,
+            int next;
+            if (shared_kv) {
+                int n_prefix = draft_model.cfg.n_layers;
+                model_forward_draft_logits(
+                    target_model, draft_kv, s_draft_input, s_draft_seq,
+                    n_prefix, hidden, g_logits,
+                    g_selfspec_hiddens + (size_t)di * d, smem);
+                __syncthreads();
+                next = global_argmax(g_logits, target_model.cfg.vocab_size, smem);
+            } else {
+                next = model_forward(draft_model, draft_kv, s_draft_input,
                                      s_draft_seq, hidden, g_logits, smem);
+            }
             if (tid == 0) {
                 s_draft_tokens[di] = next;
                 s_draft_input = next;
                 s_draft_seq++;
                 *draft_kv.seq_len = s_draft_seq;
             }
+            __syncthreads();
+        }
+
+        if (shared_kv && current_k > 0) {
+            model_forward_draft_prefix_save(
+                target_model, target_kv, s_draft_tokens[current_k - 1],
+                s_draft_seq, draft_model.cfg.n_layers,
+                hidden, g_selfspec_hiddens + (size_t)current_k * d, smem);
             __syncthreads();
         }
 
@@ -2086,12 +2477,23 @@ __global__ void megakernel_speculative_kernel(
             }
             __syncthreads();
 
+            if (shared_kv) {
+                model_batch_forward_selfspec_verify_logits(
+                    target_model, target_kv,
+                    s_verify_toks, s_target_seq_save,
+                    current_k + 1,
+                    draft_model.cfg.n_layers,
+                    g_selfspec_hiddens,
+                    g_batch_hidden, g_batch_work, g_batch_logits,
+                    smem);
+            } else {
             model_batch_forward_logits(
                 target_model, target_kv,
                 s_verify_toks, s_target_seq_save,
                 current_k + 1,
                 g_batch_hidden, g_batch_work, g_batch_logits,
                 smem);
+            }
 
             int V = target_model.cfg.vocab_size;
             for (int vi = 0; vi <= current_k; vi++) {
@@ -2129,14 +2531,17 @@ __global__ void megakernel_speculative_kernel(
 
             s_target_seq = s_target_seq_save + n_acc + 1;
             *target_kv.seq_len = s_target_seq;
-            s_draft_seq = s_draft_seq_save + n_acc;
-            *draft_kv.seq_len = s_draft_seq;
+            if (shared_kv) {
+                s_draft_seq = s_target_seq;
+            } else {
+                s_draft_seq = s_draft_seq_save + n_acc;
+                *draft_kv.seq_len = s_draft_seq;
+            }
         }
         __syncthreads();
 
+        if (!shared_kv) {
         // All-accepted: draft[k-1] K/V was never written; fill it now.
-        // After the extra forward draft_seq == target_seq — do NOT also run
-        // the bonus sync or draft_seq would overshoot by 1 (RoPE misalignment).
         if (s_n_accepted == current_k) {
             model_forward(draft_model, draft_kv, s_draft_tokens[current_k - 1],
                           s_draft_seq, hidden, g_logits, smem);
@@ -2148,6 +2553,7 @@ __global__ void megakernel_speculative_kernel(
                           s_draft_seq, hidden, g_logits, smem);
             if (tid == 0) { s_draft_seq++; *draft_kv.seq_len = s_draft_seq; }
             __syncthreads();
+        }
         }
 
         if ((eos_token >= 0 && s_last_token == eos_token) || s_generated >= max_new_tokens)
@@ -2178,6 +2584,7 @@ __global__ void megakernel_speculative_stochastic_kernel(
         float* g_batch_hidden,
         float* g_batch_work,
         float* g_batch_logits,
+        float* g_selfspec_hiddens,
         float draft_temp_initial,
         int adaptive_enabled,
         float min_draft_temp,
@@ -2187,7 +2594,8 @@ __global__ void megakernel_speculative_stochastic_kernel(
         float adapt_ewma_mix,
         unsigned long long rng_seed,
         GenerationResult* result,
-        int eos_token) {
+        int eos_token,
+        bool shared_kv) {
 
     const ModelWeights& draft_model  = *p_draft_model;
     const ModelWeights& target_model = *p_target_model;
@@ -2237,13 +2645,15 @@ __global__ void megakernel_speculative_stochastic_kernel(
     __syncthreads();
 
     for (int pi = 0; pi < prompt_len; pi++) {
-        model_forward(draft_model, draft_kv, prompt[pi],
-                      s_draft_seq, hidden, logits_draft, scratch);
-        if (tid == 0) {
-            s_draft_seq++;
-            *draft_kv.seq_len = s_draft_seq;
+        if (!shared_kv) {
+            model_forward(draft_model, draft_kv, prompt[pi],
+                          s_draft_seq, hidden, logits_draft, scratch);
+            if (tid == 0) {
+                s_draft_seq++;
+                *draft_kv.seq_len = s_draft_seq;
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         int tgt_id = model_forward(target_model, target_kv, prompt[pi],
                                    s_target_seq, hidden,
@@ -2251,6 +2661,8 @@ __global__ void megakernel_speculative_stochastic_kernel(
         if (tid == 0) {
             s_last_token = tgt_id;
             s_target_seq++;
+            if (shared_kv)
+                s_draft_seq = s_target_seq;
             *target_kv.seq_len = s_target_seq;
         }
         __syncthreads();
@@ -2285,13 +2697,17 @@ __global__ void megakernel_speculative_stochastic_kernel(
         __syncthreads();
 
         for (int di = 0; di < ck; di++) {
-            model_forward_logits(draft_model,
-                                 draft_kv,
-                                 s_cur_in,
-                                 s_draft_seq,
-                                 hidden,
-                                 logits_draft,
-                                 scratch);
+            if (shared_kv) {
+                int n_prefix = draft_model.cfg.n_layers;
+                model_forward_draft_logits(target_model, draft_kv, s_cur_in,
+                                           s_draft_seq, n_prefix,
+                                           hidden, logits_draft,
+                                           g_selfspec_hiddens + (size_t)di * dim_t,
+                                           scratch);
+            } else {
+                model_forward_logits(draft_model, draft_kv, s_cur_in,
+                                     s_draft_seq, hidden, logits_draft, scratch);
+            }
             __syncthreads();
 
             logits_inplace_softmax_temp(logits_draft,
@@ -2320,6 +2736,14 @@ __global__ void megakernel_speculative_stochastic_kernel(
             __syncthreads();
         }
 
+        if (shared_kv && ck > 0) {
+            model_forward_draft_prefix_save(
+                target_model, target_kv, s_draft_ids[ck - 1],
+                s_draft_seq, draft_model.cfg.n_layers,
+                hidden, g_selfspec_hiddens + (size_t)ck * dim_t, scratch);
+            __syncthreads();
+        }
+
         // ---- Batched target verification (reads weights ONCE for all k+1 tokens) ----
         {
             __shared__ int s_verify_toks[MAX_MEGA_K + 1];
@@ -2331,12 +2755,23 @@ __global__ void megakernel_speculative_stochastic_kernel(
             }
             __syncthreads();
 
+            if (shared_kv) {
+                model_batch_forward_selfspec_verify_logits(
+                    target_model, target_kv,
+                    s_verify_toks, s_ts_save,
+                    ck + 1,
+                    draft_model.cfg.n_layers,
+                    g_selfspec_hiddens,
+                    g_batch_hidden, g_batch_work, g_batch_logits,
+                    scratch);
+            } else {
             model_batch_forward_logits(
                 target_model, target_kv,
                 s_verify_toks, s_ts_save,
                 ck + 1,
                 g_batch_hidden, g_batch_work, g_batch_logits,
                 scratch);
+            }
 
             bool inner_done = false;
             for (int vi = 0; vi < ck; vi++) {
@@ -2443,17 +2878,18 @@ __global__ void megakernel_speculative_stochastic_kernel(
             s_target_seq = s_ts_save + s_n_accepted + 1;
 
             *target_kv.seq_len = s_target_seq;
-            s_draft_seq =
-                s_ds_save + s_n_accepted;
-
-            *draft_kv.seq_len = s_draft_seq;
+            if (shared_kv) {
+                s_draft_seq = s_target_seq;
+            } else {
+                s_draft_seq = s_ds_save + s_n_accepted;
+                *draft_kv.seq_len = s_draft_seq;
+            }
         }
 
         __syncthreads();
 
+        if (!shared_kv) {
         // All-accepted stochastic: fill missing K/V for draft[ck-1].
-        // Afterward draft_seq == target_seq; skip the bonus sync to prevent
-        // a one-step RoPE misalignment that compounds across rounds.
         if (s_n_accepted == ck && ck > 0) {
             model_forward(draft_model,
                           draft_kv,
@@ -2481,6 +2917,7 @@ __global__ void megakernel_speculative_stochastic_kernel(
                 *draft_kv.seq_len = s_draft_seq;
             }
             __syncthreads();
+        }
         }
 
         __syncthreads();
@@ -2564,23 +3001,36 @@ void megakernel_speculative(const ModelWeights& draft_model,
                 : draft_model.cfg.vocab_size;
 
     kv_cache_reset(draft_kv);
-    kv_cache_reset(target_kv);
+    if (!params.self_speculative)
+        kv_cache_reset(target_kv);
 
     ModelWeights* d_draft_model;
     ModelWeights* d_target_model;
     KVCache*      d_draft_kv;
     KVCache*      d_target_kv;
+    KVCache*      d_shared_kv = nullptr;
+
     CUDA_CHECK(cudaMalloc(&d_draft_model, sizeof(ModelWeights)));
     CUDA_CHECK(cudaMalloc(&d_target_model, sizeof(ModelWeights)));
-    CUDA_CHECK(cudaMalloc(&d_draft_kv, sizeof(KVCache)));
-    CUDA_CHECK(cudaMalloc(&d_target_kv, sizeof(KVCache)));
+
+    if (params.self_speculative) {
+        CUDA_CHECK(cudaMalloc(&d_shared_kv, sizeof(KVCache)));
+        CUDA_CHECK(cudaMemcpy(d_shared_kv, &target_kv, sizeof(KVCache),
+                              cudaMemcpyHostToDevice));
+        d_draft_kv  = d_shared_kv;
+        d_target_kv = d_shared_kv;
+    } else {
+        CUDA_CHECK(cudaMalloc(&d_draft_kv, sizeof(KVCache)));
+        CUDA_CHECK(cudaMalloc(&d_target_kv, sizeof(KVCache)));
+        CUDA_CHECK(cudaMemcpy(d_draft_kv, &draft_kv, sizeof(KVCache),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_target_kv, &target_kv, sizeof(KVCache),
+                              cudaMemcpyHostToDevice));
+    }
+
     CUDA_CHECK(cudaMemcpy(d_draft_model, &draft_model, sizeof(ModelWeights),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_target_model, &target_model, sizeof(ModelWeights),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_draft_kv, &draft_kv, sizeof(KVCache),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_target_kv, &target_kv, sizeof(KVCache),
                           cudaMemcpyHostToDevice));
 
     size_t smem_bytes = compute_smem_bytes(target_model.cfg);
@@ -2609,12 +3059,17 @@ void megakernel_speculative(const ModelWeights& draft_model,
         float* g_batch_hidden_s;
         float* g_batch_work_s;
         float* g_batch_logits_s;
+        float* g_selfspec_hiddens_s = nullptr;
         CUDA_CHECK(cudaMalloc(&g_batch_hidden_s,
                               (size_t)max_B * d_t * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_batch_work_s,
                               (size_t)(7 * d_t + MLP_FF_TILE) * max_B * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_batch_logits_s,
                               (size_t)max_B * V_t * sizeof(float)));
+        if (params.self_speculative)
+            CUDA_CHECK(cudaMalloc(&g_selfspec_hiddens_s,
+                                  (size_t)(params.spec_k + 1) * d_t *
+                                      sizeof(float)));
 
         cuda_configure_kernel_dynamic_smem(
             megakernel_speculative_stochastic_kernel,
@@ -2625,6 +3080,7 @@ void megakernel_speculative(const ModelWeights& draft_model,
             prompt, prompt_len, params.max_new_tokens, params.spec_k,
             logits_d, logits_t, corr_ws,
             g_batch_hidden_s, g_batch_work_s, g_batch_logits_s,
+            g_selfspec_hiddens_s,
             params.draft_temperature,
             params.adaptive_draft_temperature ? 1 : 0,
             params.min_draft_temperature,
@@ -2634,7 +3090,8 @@ void megakernel_speculative(const ModelWeights& draft_model,
             params.stochastic_adapt_ewma_mix,
             (unsigned long long)params.stochastic_rng_seed,
             d_result,
-            params.eos_token);
+            params.eos_token,
+            params.self_speculative ? 1 : 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         cudaFree(logits_d);
@@ -2643,6 +3100,7 @@ void megakernel_speculative(const ModelWeights& draft_model,
         cudaFree(g_batch_hidden_s);
         cudaFree(g_batch_work_s);
         cudaFree(g_batch_logits_s);
+        if (g_selfspec_hiddens_s) cudaFree(g_selfspec_hiddens_s);
     } else {
         float* g_logits;
         CUDA_CHECK(cudaMalloc(&g_logits, (size_t)vocab * sizeof(float)));
@@ -2654,12 +3112,17 @@ void megakernel_speculative(const ModelWeights& draft_model,
         float* g_batch_hidden;
         float* g_batch_work;
         float* g_batch_logits;
+        float* g_selfspec_hiddens = nullptr;
         CUDA_CHECK(cudaMalloc(&g_batch_hidden,
                               (size_t)max_B * d_t * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_batch_work,
                               (size_t)(7 * d_t + MLP_FF_TILE) * max_B * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_batch_logits,
                               (size_t)max_B * V_t * sizeof(float)));
+        if (params.self_speculative)
+            CUDA_CHECK(cudaMalloc(&g_selfspec_hiddens,
+                                  (size_t)(params.spec_k + 1) * d_t *
+                                      sizeof(float)));
 
         cuda_configure_kernel_dynamic_smem(megakernel_speculative_kernel,
                                            smem_bytes);
@@ -2669,17 +3132,23 @@ void megakernel_speculative(const ModelWeights& draft_model,
             prompt, prompt_len, params.max_new_tokens, params.spec_k,
             g_logits,
             g_batch_hidden, g_batch_work, g_batch_logits,
-            d_result, params.eos_token);
+            g_selfspec_hiddens,
+            d_result, params.eos_token, params.self_speculative ? 1 : 0);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         cudaFree(g_logits);
         cudaFree(g_batch_hidden);
         cudaFree(g_batch_work);
         cudaFree(g_batch_logits);
+        if (g_selfspec_hiddens) cudaFree(g_selfspec_hiddens);
     }
 
     cudaFree(d_draft_model);
     cudaFree(d_target_model);
-    cudaFree(d_draft_kv);
-    cudaFree(d_target_kv);
+    if (params.self_speculative) {
+        cudaFree(d_shared_kv);
+    } else {
+        cudaFree(d_draft_kv);
+        cudaFree(d_target_kv);
+    }
 }

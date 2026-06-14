@@ -5,6 +5,7 @@ Endpoints:
   POST /api/run      -- single benchmark run
   POST /api/compare  -- all 4 mode combinations side-by-side
   POST /api/sweep    -- sweep k from 1..k_max, fixed mode
+  POST /api/autotune -- grid search k (+ optional draft temp) for best throughput
 """
 
 from __future__ import annotations
@@ -45,21 +46,34 @@ class ProductionFields(BaseModel):
 
     @model_validator(mode="after")
     def production_requires_paths(self):
-        if self.production:
-            missing = []
+        if not self.production:
+            return self
+        spec_mode = getattr(self, "spec_mode", "two_model")
+        missing = []
+        if spec_mode == "self_spec":
+            if not (self.target_path and str(self.target_path).strip()):
+                missing.append("target_path")
+        else:
             if not (self.draft_path and str(self.draft_path).strip()):
                 missing.append("draft_path")
             if not (self.target_path and str(self.target_path).strip()):
                 missing.append("target_path")
-            if not (self.tokenizer_model and str(self.tokenizer_model).strip()):
-                missing.append("tokenizer_model")
-            if self.prompt_text is None or not str(self.prompt_text).strip():
-                missing.append("prompt_text")
-            if missing:
-                raise ValueError(
-                    "production mode requires non-empty: " + ", ".join(missing)
-                )
+        if not (self.tokenizer_model and str(self.tokenizer_model).strip()):
+            missing.append("tokenizer_model")
+        if self.prompt_text is None or not str(self.prompt_text).strip():
+            missing.append("prompt_text")
+        if missing:
+            raise ValueError(
+                "production mode requires non-empty: " + ", ".join(missing)
+            )
         return self
+
+
+class SpecModeFields(BaseModel):
+    """Two-model vs cascade self-speculation on one checkpoint."""
+
+    spec_mode: str = Field("two_model", pattern="^(two_model|self_spec)$")
+    draft_layers: int = Field(2, ge=1, le=39)
 
 
 class StochasticFields(BaseModel):
@@ -74,7 +88,7 @@ class StochasticFields(BaseModel):
     spec_seed: int = Field(12345, ge=0)
 
 
-class RunRequest(ProductionFields, StochasticFields):
+class RunRequest(ProductionFields, SpecModeFields, StochasticFields):
     mode: str = Field("multi", pattern="^(multi|mega)$")
     spec: bool = True
     max_tokens: int = Field(32, ge=8, le=512)
@@ -83,7 +97,7 @@ class RunRequest(ProductionFields, StochasticFields):
     prompt_len: int = Field(4, ge=1, le=16)
 
 
-class SweepRequest(ProductionFields, StochasticFields):
+class SweepRequest(ProductionFields, SpecModeFields, StochasticFields):
     mode: str = Field("multi", pattern="^(multi|mega)$")
     max_tokens: int = Field(32, ge=8, le=512)
     k_max: int = Field(8, ge=2, le=8)
@@ -91,7 +105,18 @@ class SweepRequest(ProductionFields, StochasticFields):
     prompt_len: int = Field(4, ge=1, le=16)
 
 
-def _bench_kwargs(req: RunRequest | SweepRequest) -> dict:
+class AutotuneRequest(ProductionFields, SpecModeFields, StochasticFields):
+    mode: str = Field("multi", pattern="^(multi|mega)$")
+    max_tokens: int = Field(32, ge=8, le=512)
+    k_max: int = Field(8, ge=2, le=8)
+    seed: int = Field(42, ge=0)
+    prompt_len: int = Field(4, ge=1, le=16)
+    min_acceptance: float = Field(0.70, ge=0.0, le=1.0)
+    objective: str = Field("speedup", pattern="^(speedup|tok_per_s)$")
+    sweep_temp: bool = False
+
+
+def _bench_kwargs(req: RunRequest | SweepRequest | AutotuneRequest) -> dict:
     return {
         "mode": req.mode,
         "spec": getattr(req, "spec", True),
@@ -105,6 +130,8 @@ def _bench_kwargs(req: RunRequest | SweepRequest) -> dict:
         "tokenizer_model": req.tokenizer_model,
         "prompt_text": req.prompt_text,
         "use_chat_template": req.use_chat_template,
+        "spec_mode": req.spec_mode,
+        "draft_layers": req.draft_layers,
         "stochastic": req.stochastic,
         "draft_temp": req.draft_temp,
         "adaptive_draft_temp": req.adaptive_draft_temp,
@@ -200,6 +227,58 @@ async def sweep(req: SweepRequest):
         }
         for k, r in zip(range(1, req.k_max + 1), results)
     ]
+
+
+@app.post("/api/autotune")
+async def autotune(req: AutotuneRequest):
+    """Grid-search k (and optionally draft temperature) to maximize throughput."""
+    base = _bench_kwargs(req)
+
+    if req.sweep_temp and req.stochastic:
+        temps = [0.6, 0.8, 1.0, 1.2]
+    else:
+        temps = [req.draft_temp]
+
+    combos: list[tuple[int, float]] = [
+        (k, temp) for k in range(1, req.k_max + 1) for temp in temps
+    ]
+    tasks = [
+        _run_async(**{**base, "k": k, "spec": True, "draft_temp": temp})
+        for k, temp in combos
+    ]
+    results = await asyncio.gather(*tasks)
+
+    grid = []
+    for (k, temp), r in zip(combos, results):
+        if "error" in r:
+            raise HTTPException(status_code=500, detail=r["error"])
+        grid.append(
+            {
+                "k": k,
+                "draft_temp": temp,
+                "speedup": r.get("speedup", 1.0),
+                "acceptance_rate": r.get("acceptance_rate", 0.0),
+                "spec_tok_per_s": r.get("spec_tok_per_s", 0.0),
+                "spec_ms": r.get("spec_ms", 0.0),
+            }
+        )
+
+    eligible = [
+        g for g in grid if g["acceptance_rate"] >= req.min_acceptance
+    ]
+    pool = eligible if eligible else grid
+    metric = "speedup" if req.objective == "speedup" else "spec_tok_per_s"
+    best = max(pool, key=lambda g: g[metric])
+
+    return {
+        "best": best,
+        "grid": grid,
+        "min_acceptance": req.min_acceptance,
+        "objective": req.objective,
+        "n_eligible": len(eligible),
+        "n_total": len(grid),
+        "used_fallback": len(eligible) == 0,
+    }
 
 
 if __name__ == "__main__":

@@ -131,6 +131,45 @@ __device__ void model_batch_forward_logits(
     float* g_hidden, float* g_work, float* g_logits,
     float* smem);
 
+// Self-spec draft: embed -> prefix [0, n_prefix_layers) -> save hidden ->
+// suffix [n_prefix_layers, n_layers) -> output head -> g_logits.
+// g_saved_hidden[d_model]: post-prefix activation (verify suffix input).
+__device__ void model_forward_draft_logits(
+    const ModelWeights& model, KVCache& kv,
+    int token_id, int current_seq_len,
+    int n_prefix_layers,
+    float* hidden, float* g_logits, float* g_saved_hidden,
+    float* smem);
+
+// Prefix-only forward for the verify bonus slot: save post-prefix hidden, no logits.
+__device__ void model_forward_draft_prefix_save(
+    const ModelWeights& model, KVCache& kv,
+    int token_id, int current_seq_len,
+    int n_prefix_layers,
+    float* hidden, float* g_saved_hidden, float* smem);
+
+// Self-spec verify from a saved activation: layers [layer_start, n_layers) -> logits.
+__device__ void model_forward_verify_from_hidden_logits(
+    const ModelWeights& model, KVCache& kv,
+    const float* saved_hidden, int layer_start, int current_seq_len,
+    float* hidden, float* g_logits, float* smem);
+
+// Self-spec anchor verify (position 0): embed -> prefix layers -> suffix layers -> logits.
+__device__ void model_forward_verify_anchor_logits(
+    const ModelWeights& model, KVCache& kv,
+    int token_id, int layer_start, int current_seq_len,
+    float* hidden, float* g_logits, float* smem);
+
+// Batched self-spec verify.  g_saved_hiddens[B*d_model]: saved[b] is the post-prefix
+// activation for verify position b (written during draft).  All positions load saved[b]
+// and share the suffix layer loop.
+__device__ void model_batch_forward_selfspec_verify_logits(
+    const ModelWeights& model, KVCache& kv,
+    const int* token_ids, int seq_base, int B, int layer_start,
+    const float* g_saved_hiddens,
+    float* g_hidden, float* g_work, float* g_logits_out,
+    float* smem);
+
 // ============================================================================
 // InferenceEngine — host-side state for cuBLAS handle, CUDA stream pool,
 // cooperative-launch capability, and scratch buffers for the cooperative
@@ -163,6 +202,9 @@ struct InferenceEngine {
     // Second set so draft and target streams don't alias during parallel prefill
     float* d_coop_hidden2;
     float* d_coop_scratch2;
+
+    // Self-spec: post-prefix activations [(spec_k + 1) * d_model] (bonus slot at index k)
+    float* d_selfspec_hiddens;
 
     // -----------------------------------------------------------------------
     // Intra-layer stream-overlap scratch for Q/K/V and gate/up projections.

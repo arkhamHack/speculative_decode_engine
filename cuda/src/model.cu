@@ -614,6 +614,75 @@ __device__ int model_forward(const ModelWeights& model, KVCache& kv,
 }
 
 // ============================================================================
+// Self-spec partial-forward helpers
+// ============================================================================
+
+__device__ void device_copy_hidden_to_global(const float* hidden, float* g_out,
+                                             int d) {
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        g_out[i] = hidden[i];
+    __syncthreads();
+}
+
+__device__ void model_forward_draft_prefix_save(
+    const ModelWeights& model, KVCache& kv,
+    int token_id, int current_seq_len,
+    int n_prefix_layers,
+    float* hidden, float* g_saved_hidden, float* smem) {
+    model_embed(model, token_id, hidden);
+
+    for (int l = 0; l < n_prefix_layers; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    device_copy_hidden_to_global(hidden, g_saved_hidden, model.cfg.d_model);
+}
+
+__device__ void model_forward_draft_logits(const ModelWeights& model, KVCache& kv,
+                                           int token_id, int current_seq_len,
+                                           int n_prefix_layers,
+                                           float* hidden, float* g_logits,
+                                           float* g_saved_hidden, float* smem) {
+    model_forward_draft_prefix_save(
+        model, kv, token_id, current_seq_len, n_prefix_layers,
+        hidden, g_saved_hidden, smem);
+
+    for (int l = n_prefix_layers; l < model.cfg.n_layers; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    model_output(model, hidden, g_logits, smem);
+}
+
+__device__ void model_forward_verify_from_hidden_logits(
+    const ModelWeights& model, KVCache& kv,
+    const float* saved_hidden, int layer_start, int current_seq_len,
+    float* hidden, float* g_logits, float* smem) {
+    const int d = model.cfg.d_model;
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        hidden[i] = saved_hidden[i];
+    __syncthreads();
+
+    for (int l = layer_start; l < model.cfg.n_layers; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    model_output(model, hidden, g_logits, smem);
+}
+
+__device__ void model_forward_verify_anchor_logits(
+    const ModelWeights& model, KVCache& kv,
+    int token_id, int layer_start, int current_seq_len,
+    float* hidden, float* g_logits, float* smem) {
+    model_embed(model, token_id, hidden);
+
+    for (int l = 0; l < layer_start; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    for (int l = layer_start; l < model.cfg.n_layers; l++)
+        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
+
+    model_output(model, hidden, g_logits, smem);
+}
+
+// ============================================================================
 // Device: batched forward — process B tokens, reading each weight matrix once.
 //
 // g_work layout (all B-major, floats):
@@ -879,6 +948,250 @@ __device__ void model_batch_forward_logits(
     device_matvec_batched(g_normed, model.output_proj, g_logits_out, d, V, B);
 }
 
+__device__ void model_batch_forward_selfspec_verify_logits(
+    const ModelWeights& model, KVCache& kv,
+    const int* token_ids, int seq_base, int B, int layer_start,
+    const float* g_saved_hiddens,
+    float* g_hidden, float* g_work, float* g_logits_out,
+    float* smem)
+{
+    const int tid = threadIdx.x;
+    const int d   = model.cfg.d_model;
+    const int dff = model.cfg.d_ff;
+    const int nh  = model.cfg.n_heads;
+    const int dph = d / nh;
+    const int V   = model.cfg.vocab_size;
+
+    float* g_normed  = g_work;
+    float* g_q       = g_work + 1 * B * d;
+    float* g_k       = g_work + 2 * B * d;
+    float* g_v       = g_work + 3 * B * d;
+    float* g_tmp     = g_work + 4 * B * d;
+    float* g_mlp_acc = g_work + 5 * B * d;
+    float* g_mlp_up  = g_work + 6 * B * d;
+
+    float* s_buf0   = smem;
+    float* s_buf1   = smem + d;
+    float* s_buf2   = smem + 2 * d;
+    float* s_buf3   = smem + 3 * d;
+    float* s_red    = smem + 4 * d;
+
+    // All positions: reuse draft-saved post-prefix activations (prefix KV already written).
+    for (int b = 0; b < B; b++) {
+        const float* src = g_saved_hiddens + (size_t)b * d;
+        for (int i = tid; i < d; i += blockDim.x)
+            g_hidden[b * d + i] = src[i];
+        __syncthreads();
+    }
+
+    // Suffix layer loop: layers [layer_start, n_layers) for all B positions.
+    for (int l = layer_start; l < model.cfg.n_layers; l++) {
+        const LayerWeights& lw = model.layers[l];
+
+        for (int b = 0; b < B; b++) {
+            for (int i = tid; i < d; i += blockDim.x)
+                s_buf3[i] = g_hidden[b * d + i];
+            __syncthreads();
+            device_rmsnorm(s_buf3, lw.rms_attn_weight, s_buf0, d, s_red);
+            for (int i = tid; i < d; i += blockDim.x)
+                g_normed[b * d + i] = s_buf0[i];
+            __syncthreads();
+        }
+
+        device_matvec_batched(g_normed, lw.Wq, g_q, d, d, B);
+        device_matvec_batched(g_normed, lw.Wk, g_k, d, d, B);
+        device_matvec_batched(g_normed, lw.Wv, g_v, d, d, B);
+
+        for (int b = 0; b < B; b++) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                s_buf1[i] = g_q[b * d + i];
+                s_buf3[i] = g_k[b * d + i];
+            }
+            __syncthreads();
+
+            rope_apply_heads_qk_inplace(s_buf1, s_buf3, nh, dph,
+                                        seq_base + b, model.cfg.rope_theta);
+
+            for (int i = tid; i < d; i += blockDim.x)
+                s_buf2[i] = g_v[b * d + i];
+            __syncthreads();
+
+            kv_cache_append(kv, l, s_buf3, s_buf2, seq_base + b);
+
+            for (int i = tid; i < d; i += blockDim.x)
+                g_q[b * d + i] = s_buf1[i];
+            __syncthreads();
+        }
+
+        __shared__ float s_attn_m_b;
+        __shared__ float s_attn_l_b;
+        __shared__ float s_tile_m_b;
+        __shared__ float s_alpha_b;
+        __shared__ float s_inv_den_b;
+
+        float scale = rsqrtf((float)dph);
+
+        for (int b = 0; b < B; b++) {
+            for (int i = tid; i < d; i += blockDim.x)
+                s_buf1[i] = g_q[b * d + i];
+            __syncthreads();
+
+            for (int i = tid; i < d; i += blockDim.x)
+                s_buf3[i] = 0.f;
+            __syncthreads();
+
+            int total_len = seq_base + b + 1;
+            int n_log_blks = (total_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+
+            for (int h = 0; h < nh; h++) {
+                int ho = h * dph;
+                if (tid == 0) { s_attn_m_b = -FLT_MAX; s_attn_l_b = 0.f; }
+                for (int e = tid; e < dph; e += blockDim.x)
+                    s_buf3[ho + e] = 0.f;
+                __syncthreads();
+
+                for (int lb = 0; lb < n_log_blks; lb++) {
+                    int p0 = lb * KV_BLOCK_SIZE;
+                    for (int sl = tid; sl < KV_BLOCK_SIZE; sl += blockDim.x) {
+                        int p = p0 + sl;
+                        float logit = -FLT_MAX;
+                        if (p < total_len) {
+                            int bi = p / KV_BLOCK_SIZE, si = p % KV_BLOCK_SIZE;
+                            int pb = kv.layers[l].block_table[bi];
+                            const half* base = kv.pool +
+                                (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
+                            const half* ks = base + si * kv.d_head + ho;
+                            float dot = 0.f;
+                            for (int e = 0; e < dph; e++)
+                                dot += s_buf1[ho + e] * __half2float(ks[e]);
+                            logit = dot * scale;
+                        }
+                        s_red[sl] = logit;
+                    }
+                    __syncthreads();
+
+                    if (tid == 0) {
+                        float mt = -FLT_MAX;
+                        for (int sl = 0; sl < KV_BLOCK_SIZE; sl++)
+                            if (p0 + sl < total_len)
+                                mt = fmaxf(mt, s_red[sl]);
+                        float mp = s_attn_m_b;
+                        float mn = fmaxf(mp, mt);
+                        float au = (lb > 0) ? expf(mp - mn) : 1.f;
+                        float lt = 0.f;
+                        for (int sl = 0; sl < KV_BLOCK_SIZE; sl++)
+                            if (p0 + sl < total_len)
+                                lt += expf(s_red[sl] - mn);
+                        s_attn_m_b = mn;
+                        s_attn_l_b = au * s_attn_l_b + lt;
+                        s_tile_m_b = mn;
+                        s_alpha_b  = au;
+                    }
+                    __syncthreads();
+
+                    float rp = s_alpha_b;
+                    for (int e = tid; e < dph; e += blockDim.x)
+                        s_buf3[ho + e] *= rp;
+                    __syncthreads();
+
+                    float mh = s_tile_m_b;
+                    for (int e = tid; e < dph; e += blockDim.x) {
+                        int ge = ho + e;
+                        float ac = 0.f;
+                        for (int sl = 0; sl < KV_BLOCK_SIZE; sl++) {
+                            int p = p0 + sl;
+                            if (p >= total_len) continue;
+                            float w = expf(s_red[sl] - mh);
+                            int bi = p / KV_BLOCK_SIZE, si = p % KV_BLOCK_SIZE;
+                            int pb = kv.layers[l].block_table[bi];
+                            const half* base = kv.pool +
+                                (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
+                            const half* vs = base +
+                                KV_BLOCK_SIZE * kv.d_head + si * kv.d_head;
+                            ac += w * __half2float(vs[ge]);
+                        }
+                        s_buf3[ge] += ac;
+                    }
+                    __syncthreads();
+                }
+
+                if (tid == 0)
+                    s_inv_den_b = (s_attn_l_b > 1e-20f && isfinite(s_attn_l_b))
+                        ? (1.f / s_attn_l_b) : 0.f;
+                __syncthreads();
+                float nd = s_inv_den_b;
+                for (int e = tid; e < dph; e += blockDim.x)
+                    s_buf3[ho + e] *= nd;
+                __syncthreads();
+            }
+
+            for (int i = tid; i < d; i += blockDim.x)
+                g_tmp[b * d + i] = s_buf3[i];
+            __syncthreads();
+        }
+
+        device_matvec_batched(g_tmp, lw.Wo, g_v, d, d, B);
+
+        for (int b = 0; b < B; b++)
+            for (int i = tid; i < d; i += blockDim.x)
+                g_hidden[b * d + i] += g_v[b * d + i];
+        __syncthreads();
+
+        for (int b = 0; b < B; b++) {
+            for (int i = tid; i < d; i += blockDim.x)
+                s_buf3[i] = g_hidden[b * d + i];
+            __syncthreads();
+            device_rmsnorm(s_buf3, lw.rms_mlp_weight, s_buf0, d, s_red);
+            for (int i = tid; i < d; i += blockDim.x)
+                g_normed[b * d + i] = s_buf0[i];
+            __syncthreads();
+        }
+
+        for (int b = 0; b < B; b++)
+            for (int i = tid; i < d; i += blockDim.x)
+                g_mlp_acc[b * d + i] = 0.f;
+        __syncthreads();
+
+        int tile_ff = MLP_FF_TILE < d ? MLP_FF_TILE : d;
+        for (int r0 = 0; r0 < dff; r0 += tile_ff) {
+            int ncol = tile_ff < (dff - r0) ? tile_ff : (dff - r0);
+
+            device_matvec_cols_batched(g_normed, lw.W_gate,
+                                       d, dff, r0, ncol, g_tmp, B);
+            device_matvec_cols_batched(g_normed, lw.W_up,
+                                       d, dff, r0, ncol, g_mlp_up, B);
+
+            for (int b = 0; b < B; b++) {
+                for (int jc = tid; jc < ncol; jc += blockDim.x) {
+                    float g = g_tmp[b * ncol + jc];
+                    g_tmp[b * ncol + jc] =
+                        (g / (1.0f + expf(-g))) * g_mlp_up[b * ncol + jc];
+                }
+            }
+            __syncthreads();
+
+            device_down_proj_accum_batched(g_tmp, lw.W_down,
+                                           d, dff, r0, ncol, g_mlp_acc, B);
+        }
+
+        for (int b = 0; b < B; b++)
+            for (int i = tid; i < d; i += blockDim.x)
+                g_hidden[b * d + i] += g_mlp_acc[b * d + i];
+        __syncthreads();
+    }
+
+    for (int b = 0; b < B; b++) {
+        for (int i = tid; i < d; i += blockDim.x)
+            s_buf3[i] = g_hidden[b * d + i];
+        __syncthreads();
+        device_rmsnorm(s_buf3, model.rms_final_weight, s_buf0, d, s_red);
+        for (int i = tid; i < d; i += blockDim.x)
+            g_normed[b * d + i] = s_buf0[i];
+        __syncthreads();
+    }
+    device_matvec_batched(g_normed, model.output_proj, g_logits_out, d, V, B);
+}
+
 // ============================================================================
 // InferenceEngine: init / destroy
 // ============================================================================
@@ -923,6 +1236,11 @@ void inference_engine_init(InferenceEngine& eng, const ModelConfig& cfg) {
     CUDA_CHECK(cudaMalloc(&eng.d_coop_hidden2,  (size_t)d * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&eng.d_coop_scratch2, scratch_n  * sizeof(float)));
 
+    // Self-spec post-prefix activations: k draft slots + 1 bonus verify slot (max k = 16).
+    constexpr int kMaxSelfSpecK = 17;
+    CUDA_CHECK(cudaMalloc(&eng.d_selfspec_hiddens,
+                          (size_t)kMaxSelfSpecK * d * sizeof(float)));
+
     // Intra-layer stream-overlap projection scratch (two sets: target + draft).
     // Each set: [7*d_model + 2*d_ff] floats.  See model.h for layout details.
     eng.ovl_buf_d   = cfg.d_model;
@@ -945,6 +1263,7 @@ void inference_engine_destroy(InferenceEngine& eng) {
     auto sf = [](void* p) { if (p) cudaFree(p); };
     sf(eng.d_coop_hidden);   sf(eng.d_coop_scratch);
     sf(eng.d_coop_hidden2);  sf(eng.d_coop_scratch2);
+    sf(eng.d_selfspec_hiddens);
     for (int s = 0; s < 2; s++) sf(eng.d_ovl_buf[s]);
     for (int e = 0; e < 3; e++) cudaEventDestroy(eng.ovl_events[e]);
     memset(&eng, 0, sizeof(eng));

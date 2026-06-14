@@ -5,12 +5,15 @@ import ResultsPanel  from './components/ResultsPanel.jsx'
 import CompareChart  from './components/CompareChart.jsx'
 import SpecTimeline  from './components/SpecTimeline.jsx'
 import SweepChart    from './components/SweepChart.jsx'
+import AutotunePanel from './components/AutotunePanel.jsx'
 
 const API = ''  // proxied via Vite → localhost:8000
 
 const DEFAULT_CONFIG = {
   mode:      'multi',
   spec:      true,
+  specMode:  'two_model',
+  draftLayers: 2,
   k:         4,
   maxTokens: 128,
   promptLen: 4,
@@ -21,6 +24,9 @@ const DEFAULT_CONFIG = {
   tokenizerModel: '',
   promptText: 'Once upon a time',
   useChatTemplate: true,
+  minAcceptance: 0.70,
+  autotuneObjective: 'speedup',
+  sweepTemp: false,
   // Stochastic spec decode (Leviathan et al. exact algorithm)
   stochastic:        false,
   draftTemp:         1.0,
@@ -49,6 +55,7 @@ function TabBar({ active, onChange }) {
     { id: 'single',  label: '⚡ Single run' },
     { id: 'compare', label: '📊 Compare modes' },
     { id: 'sweep',   label: '🔍 Sweep k' },
+    { id: 'autotune', label: '🎯 Autotune' },
   ]
   return (
     <div className="flex gap-1 bg-zinc-900 border border-zinc-800 rounded-lg p-1 w-fit">
@@ -104,6 +111,10 @@ export default function App() {
   const [sweepData,   setSweepData]   = useState(null)
   const [sweepLoading,setSweepLoading]= useState(false)
 
+  // Autotune
+  const [autotuneData,   setAutotuneData]   = useState(null)
+  const [autotuneLoading,setAutotuneLoading]= useState(false)
+
   // Check backend on load
   useEffect(() => {
     fetch('/api/health')
@@ -115,6 +126,8 @@ export default function App() {
   const buildBody = () => ({
     mode:        config.mode,
     spec:        config.spec,
+    spec_mode:   config.specMode,
+    draft_layers: config.draftLayers,
     max_tokens:  config.maxTokens,
     k:           config.k,
     seed:        config.seed,
@@ -126,6 +139,36 @@ export default function App() {
     adapt_gain:          config.adaptGain,
     adapt_ewma:          config.adaptEwma,
     spec_seed:           config.specSeed,
+    ...(config.production
+      ? {
+          production: true,
+          draft_path: config.draftPath,
+          target_path: config.targetPath,
+          tokenizer_model: config.tokenizerModel,
+          prompt_text: config.promptText,
+          use_chat_template: config.useChatTemplate,
+        }
+      : { production: false }),
+  })
+
+  const buildAutotuneBody = () => ({
+    mode: config.mode,
+    max_tokens: config.maxTokens,
+    k_max: config.k,
+    seed: config.seed,
+    prompt_len: config.promptLen,
+    spec_mode: config.specMode,
+    draft_layers: config.draftLayers,
+    min_acceptance: config.minAcceptance,
+    objective: config.autotuneObjective,
+    sweep_temp: config.sweepTemp,
+    stochastic: config.stochastic,
+    draft_temp: config.draftTemp,
+    adaptive_draft_temp: config.adaptiveDraftTemp,
+    adapt_accept: config.adaptAccept,
+    adapt_gain: config.adaptGain,
+    adapt_ewma: config.adaptEwma,
+    spec_seed: config.specSeed,
     ...(config.production
       ? {
           production: true,
@@ -175,6 +218,8 @@ export default function App() {
         k_max:      config.k,
         seed:       config.seed,
         prompt_len: config.promptLen,
+        spec_mode:  config.specMode,
+        draft_layers: config.draftLayers,
         stochastic:          config.stochastic,
         draft_temp:          config.draftTemp,
         adaptive_draft_temp: config.adaptiveDraftTemp,
@@ -201,7 +246,29 @@ export default function App() {
     }
   }
 
-  const anyLoading = runLoading || cmpLoading || sweepLoading
+  const handleAutotune = async () => {
+    setAutotuneLoading(true)
+    setActiveTab('autotune')
+    try {
+      const r = await apiFetch('autotune', buildAutotuneBody())
+      setAutotuneData(r)
+    } catch (e) {
+      setAutotuneData(null)
+    } finally {
+      setAutotuneLoading(false)
+    }
+  }
+
+  const applyAutotuneBest = (best) => {
+    setConfig(c => ({
+      ...c,
+      k: best.k,
+      draftTemp: best.draft_temp ?? c.draftTemp,
+    }))
+    setActiveTab('single')
+  }
+
+  const anyLoading = runLoading || cmpLoading || sweepLoading || autotuneLoading
 
   return (
     <div className="min-h-screen bg-zinc-950 flex flex-col">
@@ -233,6 +300,7 @@ export default function App() {
           onRun={handleRun}
           onCompare={handleCompare}
           onSweep={handleSweep}
+          onAutotune={handleAutotune}
           loading={anyLoading}
         />
 
@@ -273,6 +341,17 @@ export default function App() {
                       Very long contexts may still differ slightly from HF if the checkpoint uses{' '}
                       <code className="text-zinc-400">rope_scaling</code> (not replicated here).
                     </p>
+                  ) : config.specMode === 'self_spec' ? (
+                    <>
+                      <p>
+                        <span className="text-zinc-300">Self-speculative</span> mode uses early layers
+                        (1–{config.draftLayers}) of the same model as a draft proposer; the full model verifies.
+                        No second checkpoint required.
+                      </p>
+                      <p>
+                        Expected speedup depends on how well early-layer logits align with the full model.
+                      </p>
+                    </>
                   ) : (
                     <>
                       <p>
@@ -328,6 +407,28 @@ export default function App() {
                     then falls as acceptance probability drops and wasted compute increases.
                     The optimal k* balances these forces. The purple dashed line shows how
                     acceptance rate α declines with larger k.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+          {/* Autotune tab */}
+          {activeTab === 'autotune' && (
+            <div className="space-y-4">
+              <AutotunePanel
+                data={autotuneData}
+                loading={autotuneLoading}
+                onApply={applyAutotuneBest}
+              />
+              {autotuneData?.best && (
+                <div className="card text-xs text-zinc-500 space-y-1">
+                  <div className="label">How autotuning works</div>
+                  <p>
+                    The autotuner runs a grid search over k ∈ [1, {config.k}]
+                    {config.sweepTemp && config.stochastic ? ' and draft temperature' : ''},
+                    filters configs with acceptance ≥ {(config.minAcceptance * 100).toFixed(0)}%,
+                    then picks the best by {config.autotuneObjective === 'speedup' ? 'speedup' : 'throughput (tok/s)'}.
+                    Click <span className="text-zinc-400">Apply to config</span> to use the recommended settings.
                   </p>
                 </div>
               )}

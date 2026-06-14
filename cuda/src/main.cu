@@ -30,6 +30,8 @@ struct Args {
     char   target_path[512] = "";         // --target=path/to/target.bin
     char   prompt_tok[512]  = "";         // --prompt-tok=path/to/prompt.tok
     char   output_tok[512]  = "";         // --output-tok=path  (write generated ids)
+    bool   self_spec        = false;      // --self-spec  (early layers draft, full model target)
+    int    draft_layers     = 0;          // --draft-layers=N  (default: target_n_layers / 2)
 };
 
 static void usage(const char* prog) {
@@ -49,6 +51,8 @@ static void usage(const char* prog) {
         "  --adapt-gain=G        Δtemp per EWMA deviation step, default 0.055\n"
         "  --adapt-ewma=M       mix weight for EWMA ∈ (0,1), default 0.25\n"
         "  --spec-seed=N         RNG seed for stochastic spec (default: 12345)\n"
+        "  --self-spec           self-speculative: early layers draft, full model target\n"
+        "  --draft-layers=N      layers 1..N as draft proposer (default: target_layers/2)\n"
         "\n"
         "Real-model mode (requires SDEC weight files + tokenised prompt):\n"
         "  --draft=path.bin      draft model SDEC binary (from tools/export_model.py)\n"
@@ -100,6 +104,10 @@ static void parse_args(Args& args, int argc, char** argv) {
             strncpy(args.prompt_tok, argv[i] + 13, 511);
         } else if (strncmp(argv[i], "--output-tok=", 13) == 0) {
             strncpy(args.output_tok, argv[i] + 13, 511);
+        } else if (strcmp(argv[i], "--self-spec") == 0) {
+            args.self_spec = true;
+        } else if (strncmp(argv[i], "--draft-layers=", 15) == 0) {
+            args.draft_layers = atoi(argv[i] + 15);
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); exit(0);
@@ -139,27 +147,52 @@ int main(int argc, char** argv) {
            prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
 
     // ---- Decide operating mode: real weights or dummy ----
-    bool use_real = (args.draft_path[0] != '\0' &&
-                     args.target_path[0] != '\0');
+    bool use_real = (args.target_path[0] != '\0' &&
+                     (args.draft_path[0] != '\0' || args.self_spec));
+    if (args.self_spec && args.draft_path[0] == '\0' && args.target_path[0] != '\0') {
+        // Production self-spec: only --target= required; draft reuses same weights.
+        strncpy(args.draft_path, args.target_path, 511);
+    }
 
-    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d | stochastic_spec=%d\n\n",
+    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d | stochastic_spec=%d",
            use_real ? "real-model" : "dummy",
            args.use_mega ? "megakernel" : "multi-kernel",
            args.max_new, args.spec_k, args.stochastic_spec ? 1 : 0);
+    if (args.self_spec)
+        printf(" | self-spec");
+    printf("\n\n");
 
     // ---- Build / load models ----
     ModelWeights draft_model, target_model;
+    bool draft_is_alias = false;
 
     if (use_real) {
-        printf("Loading draft model: %s\n", args.draft_path);
-        if (!model_load_weights(draft_model, args.draft_path, nullptr)) {
-            fprintf(stderr, "Failed to load draft model\n"); return 1;
-        }
-        printf("Loading target model: %s\n", args.target_path);
-        if (!model_load_weights(target_model, args.target_path, nullptr)) {
-            fprintf(stderr, "Failed to load target model\n"); return 1;
+        if (args.self_spec) {
+            printf("Loading target model (self-spec): %s\n", args.target_path);
+            if (!model_load_weights(target_model, args.target_path, nullptr)) {
+                fprintf(stderr, "Failed to load target model\n"); return 1;
+            }
+            draft_model = target_model;
+            draft_is_alias = true;
+        } else {
+            printf("Loading draft model: %s\n", args.draft_path);
+            if (!model_load_weights(draft_model, args.draft_path, nullptr)) {
+                fprintf(stderr, "Failed to load draft model\n"); return 1;
+            }
+            printf("Loading target model: %s\n", args.target_path);
+            if (!model_load_weights(target_model, args.target_path, nullptr)) {
+                fprintf(stderr, "Failed to load target model\n"); return 1;
+            }
         }
         printf("\n");
+    } else if (args.self_spec) {
+        ModelConfig target_cfg = make_target_config();
+        model_alloc(target_model, target_cfg);
+        model_init_random(target_model, args.seed);
+        draft_model = target_model;
+        draft_is_alias = true;
+        printf("Dummy self-spec model: d=%d/%dh, %d layers total\n",
+               target_cfg.d_model, target_cfg.n_heads, target_cfg.n_layers);
     } else {
         ModelConfig draft_cfg  = make_draft_config();
         ModelConfig target_cfg = make_target_config();
@@ -171,6 +204,19 @@ int main(int argc, char** argv) {
                draft_cfg.d_model, draft_cfg.n_heads,
                target_cfg.d_model, target_cfg.n_heads,
                target_cfg.vocab_size);
+    }
+
+    // Self-spec: draft runs only the first n_draft_layers (same weights as target).
+    if (args.self_spec) {
+        int n_dl = args.draft_layers > 0
+                 ? args.draft_layers
+                 : target_model.cfg.n_layers / 2;
+        if (n_dl < 1) n_dl = 1;
+        if (n_dl >= target_model.cfg.n_layers)
+            n_dl = target_model.cfg.n_layers - 1;
+        draft_model.cfg.n_layers = n_dl;
+        printf("Self-spec draft layers: 1..%d | target layers: 1..%d\n\n",
+               n_dl, target_model.cfg.n_layers);
     }
 
     // ---- Build prompt ----
@@ -204,8 +250,17 @@ int main(int argc, char** argv) {
     ModelConfig& tc = target_model.cfg;
 
     KVCache draft_kv, target_kv, baseline_kv;
-    kv_cache_alloc(draft_kv,    dc.n_layers, dc.d_head, MAX_KV_BLOCKS);
-    kv_cache_alloc(target_kv,   tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
+    const bool kv_shared = args.self_spec;
+
+    if (kv_shared) {
+        // Self-spec: one cache (full target depth); draft partial forwards share it.
+        kv_cache_alloc(target_kv, tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
+        draft_kv = target_kv;
+        printf("KV cache: shared (target depth %d layers)\n", tc.n_layers);
+    } else {
+        kv_cache_alloc(draft_kv,    dc.n_layers, dc.d_head, MAX_KV_BLOCKS);
+        kv_cache_alloc(target_kv,   tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
+    }
     kv_cache_alloc(baseline_kv, tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
 
     // ---- Initialise InferenceEngine (cooperative launch + stream pool) ----
@@ -235,6 +290,8 @@ int main(int argc, char** argv) {
     params.stochastic_adapt_temp_gain     = args.adapt_gain;
     params.stochastic_adapt_ewma_mix       = args.adapt_ewma_mix;
     params.eos_token                       = args.eos_token;
+    params.self_speculative                = args.self_spec;
+    params.n_draft_layers                  = draft_model.cfg.n_layers;
 
     if (args.eos_token >= 0)
         printf("EOS token: %d\n", args.eos_token);
@@ -278,7 +335,8 @@ int main(int argc, char** argv) {
     // ==========================================================
     // Speculative decoding
     // ==========================================================
-    printf("\n=== Speculative (draft+target, k=%d) ===\n", args.spec_k);
+    printf("\n=== Speculative (%s, k=%d) ===\n",
+           args.self_spec ? "self-spec" : "draft+target", args.spec_k);
 
     CUDA_CHECK(cudaEventRecord(ev_start));
     if (args.use_mega) {
@@ -372,10 +430,15 @@ int main(int argc, char** argv) {
     cudaFree(d_prompt);
     cudaFree(d_baseline_result);
     cudaFree(d_spec_result);
-    kv_cache_free(draft_kv);
-    kv_cache_free(target_kv);
     kv_cache_free(baseline_kv);
-    model_free(draft_model);
+    if (kv_shared) {
+        kv_cache_free(target_kv);
+    } else {
+        kv_cache_free(draft_kv);
+        kv_cache_free(target_kv);
+    }
+    if (!draft_is_alias)
+        model_free(draft_model);
     model_free(target_model);
     delete[] h_prompt;
 
