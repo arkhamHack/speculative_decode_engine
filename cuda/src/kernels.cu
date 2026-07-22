@@ -1,10 +1,11 @@
 #include "kernels.h"
+#include "attention.h"
+#include "gemm_backend.h"
 #include "utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <cooperative_groups.h>
-#include <cublas_v2.h>
 #include <cmath>
 #include <cfloat>
 
@@ -94,52 +95,6 @@ __device__ void logits_inplace_softmax_temp(float* logits, int V, float temperat
     __syncthreads();
 }
 
-// Draft forward + temperature-softmax logits + categorical sample (thread 0 only).
-__global__ void stochastic_draft_forward_sample_kernel(
-        ModelWeights draft_model,
-        KVCache kv,
-        int token_id,
-        int seq_len,
-        float temperature,
-        curandState* rng,
-        float* g_logits,
-        int* sampled_id,
-        float* sampled_q_prob // device float[1], q(token) mass under tempered softmax
-        ) {
-    extern __shared__ float shared[];
-
-    int d = draft_model.cfg.d_model;
-    int V = draft_model.cfg.vocab_size;
-    float* hidden = shared;
-    float* smem   = shared + d;
-
-    model_forward_logits(draft_model, kv, token_id, seq_len, hidden, g_logits,
-                         smem);
-    __syncthreads();
-
-    float* softmax_scratch = hidden; // repurpose scratch after forward [d floats]
-    logits_inplace_softmax_temp(g_logits, V, temperature, softmax_scratch);
-
-    if (threadIdx.x == 0) {
-        float u     = curand_uniform(rng);
-        float cdf   = 0.f;
-        int   choice = V - 1;
-        for (int i = 0; i < V; i++) {
-            cdf += g_logits[i];
-            if (u <= cdf || i == V - 1) {
-                choice = i;
-                break;
-            }
-        }
-
-        sampled_id[0]       = choice;
-        sampled_q_prob[0]   = g_logits[choice];
-        // restore raw logits unnecessary — next sampling path overwrites logits.
-    }
-
-    __syncthreads();
-}
-
 // Device-pointer variant: reads token_id from device memory so consecutive draft
 // steps can be chained without a CPU roundtrip between them.
 __global__ void stochastic_draft_forward_sample_dptr_kernel(
@@ -221,47 +176,6 @@ __global__ void stochastic_draft_forward_sample_save_dptr_kernel(
         sampled_q_prob[0] = g_logits[choice];
     }
     __syncthreads();
-}
-
-// Forward target, then softmax p(idx) without destroying raw logits buffer.
-__global__ void target_forward_prob_mass_kernel(ModelWeights target_model,
-                                                KVCache kv,
-                                                int token_id,
-                                                int seq_len,
-                                                int idx,
-                                                float* g_logits,
-                                                float* mass_out_device // float[1]
-                                                ) {
-    extern __shared__ float shared[];
-    int d = target_model.cfg.d_model;
-    int V = target_model.cfg.vocab_size;
-
-    float* hidden  = shared;
-    float* lay_smem = shared + d;
-
-    model_forward_logits(target_model, kv, token_id, seq_len, hidden,
-                         g_logits, lay_smem);
-    __syncthreads();
-
-    float* softmax_reduction = hidden; // repurposed — forward complete
-    float  pm                = logits_softmax_prob_at_global(
-        g_logits, V, idx, 1.f, softmax_reduction);
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-        mass_out_device[0] = pm;
-}
-
-__global__ void stochastic_accept_gate_kernel(float               p_mass,
-                                              float               q_mass,
-                                               curandState* rng_state,
-                                               int* accepted_flag // 0/1
-                                              ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0)
-        return;
-    float q_eff = fmaxf(q_mass, 1e-36f);
-    float cap   = fminf(1.f, p_mass / q_eff);
-    accepted_flag[0] = (curand_uniform(rng_state) <= cap) ? 1 : 0;
 }
 
 // Fused kernel: target forward pass + p-mass computation + stochastic acceptance gate.
@@ -546,411 +460,59 @@ __global__ void softmax_sample_temperature_kernel(float* logits,
     out_token[0] = V - 1;
 }
 
+// Sample from raw logits and also return the chosen token's probability mass.
+// Mutates logits in-place to softmax probabilities.
+__global__ void sample_from_logits_q_kernel(float* logits, int V,
+                                            float temperature,
+                                            curandState* rng,
+                                            int* sampled_id,
+                                            float* sampled_q_prob) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float inv_t = temperature < 1e-6f ? 1e6f : 1.f / temperature;
+
+    float mx = -FLT_MAX;
+    for (int i = 0; i < V; i++)
+        mx = fmaxf(mx, logits[i] * inv_t);
+    float s = 0.f;
+    for (int i = 0; i < V; i++) {
+        logits[i] = expf(logits[i] * inv_t - mx);
+        s += logits[i];
+    }
+    for (int i = 0; i < V; i++)
+        logits[i] /= s;
+
+    float u   = curand_uniform(rng);
+    float cdf = 0.f;
+    int choice = V - 1;
+    for (int i = 0; i < V; i++) {
+        cdf += logits[i];
+        if (u <= cdf || i == V - 1) { choice = i; break; }
+    }
+    sampled_id[0]     = choice;
+    sampled_q_prob[0] = logits[choice];
+}
+
+// Stochastic accept gate from raw (unnormalized) target logits.
+// Does not mutate logits (read-only mass computation).
+__global__ void accept_from_logits_kernel(float* g_logits, int V,
+                                          int draft_token, float q_mass,
+                                          curandState* rng,
+                                          int* accepted_flag) {
+    extern __shared__ float shared[];
+    float* scratch = shared;
+    float pm = logits_softmax_prob_at_global(g_logits, V, draft_token, 1.f, scratch);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float q_eff = fmaxf(q_mass, 1e-36f);
+        float cap   = fminf(1.f, pm / q_eff);
+        *accepted_flag = (curand_uniform(rng) < cap) ? 1 : 0;
+    }
+}
+
 __global__ void rng_init_kernel(curandState* state,
                                 unsigned long long seed_worker) {
     if (blockIdx.x == 0 && threadIdx.x == 0)
         curand_init(seed_worker, 0ULL, 0ULL, state);
-}
-
-// ============================================================================
-// Standalone single-block kernels for intra-layer Q/K/V + gate/up stream overlap
-//
-// These are launched individually on separate CUDA streams so that Q, K, V
-// projections (and gate, up projections) execute concurrently on the GPU
-// when the device has sufficient SM resources.
-//
-// All take global-memory pointers; no shared-memory coupling between kernels.
-// ============================================================================
-
-// Embedding lookup → global memory hidden state.
-__global__ void embed_global_kernel(
-    ModelWeights model, int token_id, float* g_hidden)
-{
-    model_embed(model, token_id, g_hidden);
-}
-
-// RMSNorm: g_x → g_out, using static smem for the warp reduction.
-__global__ void rmsnorm_global_kernel(
-    const float* __restrict__ g_x,
-    const half*  __restrict__ g_weight,
-    float*       g_out,
-    int d)
-{
-    __shared__ float s_red[BLOCK_THREADS / WARP_SIZE];
-    device_rmsnorm(g_x, g_weight, g_out, d, s_red);
-}
-
-// Full GEMV: g_x @ g_W → g_out (single block, stride loop over d_out).
-__global__ void gemv_global_kernel(
-    const float* __restrict__ g_x,
-    const half*  __restrict__ g_W,
-    float*       g_out,
-    int d_in, int d_out)
-{
-    device_matvec(g_x, g_W, g_out, d_in, d_out);
-}
-
-// Multi-block GEMV: each block handles one BLOCK_THREADS-wide column tile.
-// Launch with <<<(d_out+BLOCK_THREADS-1)/BLOCK_THREADS, BLOCK_THREADS, 0, stream>>>.
-// Uses L1 read-only cache (__ldg) for weight matrix; input vector fits in L2.
-// Compared to gemv_global_kernel (1 SM) this fans out across all available SMs.
-__global__ void gemv_mb_kernel(
-    const float* __restrict__ g_x,
-    const half*  __restrict__ g_W,
-    float*       g_out,
-    int d_in, int d_out)
-{
-    int col = (int)blockIdx.x * blockDim.x + (int)threadIdx.x;
-    if (col >= d_out) return;
-    float acc = 0.f;
-    for (int row = 0; row < d_in; row++)
-        acc += g_x[row] * __half2float(__ldg(&g_W[row * d_out + col]));
-    g_out[col] = acc;
-}
-
-// In-place RoPE on Q and K stored in global memory.
-__global__ void rope_qk_global_kernel(
-    float* g_q, float* g_k,
-    int n_heads, int d_head_per, int seq_pos, float rope_theta)
-{
-    rope_apply_heads_qk_inplace(g_q, g_k, n_heads, d_head_per,
-                                seq_pos, rope_theta);
-}
-
-// Write pre-computed (and RoPE'd) K and V into the paged KV cache.
-__global__ void kv_write_kernel(
-    KVCache kv, int layer_idx,
-    const float* g_k, const float* g_v,
-    int seq_pos)
-{
-    kv_cache_append(kv, layer_idx, g_k, g_v, seq_pos);
-}
-
-// Flash attention with Q supplied from global memory.
-// Uses causal mask: attends to positions [0 .. total_len).
-// Static shared memory only — no dynamic smem argument needed.
-__global__ void flash_attn_global_kernel(
-    const float* g_q,       // [d_model] Q (with RoPE)
-    float*       g_attn_out,// [d_model] output (unnormalised accumulator)
-    KVCache kv, int layer_idx,
-    int d, int n_heads, int total_len, float scale)
-{
-    __shared__ float blk_logits[KV_BLOCK_SIZE];
-    __shared__ float s_m, s_l, s_m_tile, s_alpha, s_inv_den;
-
-    const int tid = threadIdx.x;
-    const int dph = d / n_heads;
-    const int n_log_blks = (total_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-
-    for (int i = tid; i < d; i += blockDim.x) g_attn_out[i] = 0.f;
-    __syncthreads();
-
-    for (int h = 0; h < n_heads; h++) {
-        const int ho = h * dph;
-
-        if (tid == 0) { s_m = -FLT_MAX; s_l = 0.f; }
-        for (int ei = tid; ei < dph; ei += blockDim.x)
-            g_attn_out[ho + ei] = 0.f;
-        __syncthreads();
-
-        for (int lb = 0; lb < n_log_blks; lb++) {
-            const int p0 = lb * KV_BLOCK_SIZE;
-
-            for (int sl = tid; sl < KV_BLOCK_SIZE; sl += blockDim.x) {
-                int p = p0 + sl;
-                float logit = -FLT_MAX;
-                if (p < total_len) {
-                    int bidx = p / KV_BLOCK_SIZE, sl_kv = p % KV_BLOCK_SIZE;
-                    int pb   = kv.layers[layer_idx].block_table[bidx];
-                    const half* base =
-                        kv.pool + (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
-                    const half* k_src = base + sl_kv * kv.d_head + ho;
-                    float dot = 0.f;
-                    for (int e = 0; e < dph; e++)
-                        dot += g_q[ho + e] * __half2float(k_src[e]);
-                    logit = dot * scale;
-                }
-                blk_logits[sl] = logit;
-            }
-            __syncthreads();
-
-            if (tid == 0) {
-                float mt = -FLT_MAX;
-                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++)
-                    if (p0 + sl < total_len) mt = fmaxf(mt, blk_logits[sl]);
-                float mp = s_m, mn = fmaxf(mp, mt);
-                float au = (lb > 0) ? expf(mp - mn) : 1.f;
-                float lt = 0.f;
-                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++)
-                    if (p0 + sl < total_len) lt += expf(blk_logits[sl] - mn);
-                s_m = mn;  s_l = au * s_l + lt;
-                s_m_tile = mn;  s_alpha = au;
-            }
-            __syncthreads();
-
-            float rp = s_alpha;
-            for (int ei = tid; ei < dph; ei += blockDim.x)
-                g_attn_out[ho + ei] *= rp;
-            __syncthreads();
-
-            float mh = s_m_tile;
-            for (int ei = tid; ei < dph; ei += blockDim.x) {
-                int ge = ho + ei;
-                float acc = 0.f;
-                for (int sl = 0; sl < KV_BLOCK_SIZE; sl++) {
-                    int p = p0 + sl;
-                    if (p >= total_len) continue;
-                    float w = expf(blk_logits[sl] - mh);
-                    int bidx = p / KV_BLOCK_SIZE, sl_kv = p % KV_BLOCK_SIZE;
-                    int pb   = kv.layers[layer_idx].block_table[bidx];
-                    const half* base =
-                        kv.pool + (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
-                    const half* v_src =
-                        base + KV_BLOCK_SIZE * kv.d_head + sl_kv * kv.d_head;
-                    acc += w * __half2float(v_src[ge]);
-                }
-                g_attn_out[ge] += acc;
-            }
-            __syncthreads();
-        }
-
-        if (tid == 0)
-            s_inv_den = (s_l > 1e-20f && isfinite(s_l)) ? (1.f / s_l) : 0.f;
-        __syncthreads();
-        float nd = s_inv_den;
-        for (int ei = tid; ei < dph; ei += blockDim.x)
-            g_attn_out[ho + ei] *= nd;
-        __syncthreads();
-    }
-}
-
-// Element-wise residual add: g_x[i] += g_delta[i].
-__global__ void residual_add_kernel(float* g_x, const float* g_delta, int d)
-{
-    for (int i = threadIdx.x; i < d; i += blockDim.x)
-        g_x[i] += g_delta[i];
-    __syncthreads();
-}
-
-// Zero a float buffer of length n.
-__global__ void zero_buf_kernel(float* g_buf, int n)
-{
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-        g_buf[i] = 0.f;
-    __syncthreads();
-}
-
-// Full gate or up projection: g_x @ g_W → g_out  (same as gemv_global_kernel;
-// kept as a named alias for readability in the MLP overlap path).
-__global__ void proj_global_kernel(
-    const float* __restrict__ g_x,
-    const half*  __restrict__ g_W,
-    float*       g_out,
-    int d_in, int d_out)
-{
-    device_matvec(g_x, g_W, g_out, d_in, d_out);
-}
-
-// Fused SwiGLU + W_down GEMV, writing result to g_out (overwrites, not accumulates).
-// g_gate is modified in-place to hold the activated values; g_up is read-only.
-__global__ void swiglu_down_kernel(
-    float*       g_gate,    // [dff]  in/out: gate logits → SwiGLU(gate)*up
-    const float* g_up,      // [dff]
-    const half*  W_down,    // [dff, d] row-major
-    float*       g_out,     // [d]
-    int d, int dff)
-{
-    int tid = threadIdx.x;
-
-    // Pass 1: SwiGLU activation in-place on g_gate.
-    for (int i = tid; i < dff; i += blockDim.x) {
-        float g  = g_gate[i];
-        g_gate[i] = (g / (1.f + expf(-g))) * g_up[i];
-    }
-    __syncthreads();
-
-    // Pass 2: W_down @ g_gate_activated → g_out.
-    // g_gate (activated, d_ff floats) fits in L2 cache on all target GPUs.
-    for (int oc = tid; oc < d; oc += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dff; i++)
-            acc += g_gate[i] * __half2float(__ldg(&W_down[i * d + oc]));
-        g_out[oc] = acc;
-    }
-    __syncthreads();
-}
-
-// Final RMSNorm + output projection + greedy argmax in one block.
-// smem must be at least 2*BLOCK_THREADS floats (for global_argmax scratch).
-__global__ void output_argmax_global_kernel(
-    ModelWeights model,
-    const float* g_hidden,
-    float*       g_normed,   // scratch for normalised hidden (global memory)
-    float*       g_logits,   // [vocab_size]
-    int*         d_next)
-{
-    extern __shared__ float smem[];
-    const int d = model.cfg.d_model;
-    const int V = model.cfg.vocab_size;
-
-    device_rmsnorm(g_hidden, model.rms_final_weight, g_normed, d, smem);
-    device_matvec(g_normed, model.output_proj, g_logits, d, V);
-    int next = global_argmax(g_logits, V, smem);
-    if (threadIdx.x == 0) *d_next = next;
-}
-
-// ============================================================================
-// launch_prefill_overlapped
-//
-// Runs a complete single-token forward pass through `model` using separate
-// CUDA streams so that projections that are data-independent (Q||K||V and
-// gate||up) execute concurrently on the GPU.
-//
-// Stream assignment:
-//   s_main    — sequential work (embed, RMSNorm, RoPE, attention, residuals,
-//               output head, Q projection, gate projection)
-//   s_k       — K projection (parallel with Q)
-//   s_v_gate  — V projection (parallel with Q+K); up projection (parallel
-//               with gate in the MLP sub-layer)
-//
-// The three streams are synchronised with ovl_events[0..2] at each
-// data-dependency boundary.  Results are written to the named regions of
-// d_ovl_buf (see InferenceEngine layout in model.h).
-//
-// After return, d_next_token contains the greedy next-token argmax.
-// The caller must set_seq_len_kernel and/or sync s_main as needed.
-//
-// Only activated for models with d_model >= OVERLAP_MIN_D.
-// ============================================================================
-
-static constexpr int OVERLAP_MIN_D = 1024;  // skip tiny/dummy models
-
-static void launch_prefill_overlapped(
-    const ModelWeights& model, KVCache& kv,
-    int token_id, int seq_pos,
-    float* d_ovl_buf,       // [7*d + 2*dff] work buffer for this model
-    float* g_logits,        // [vocab_size]  output logits
-    int*   d_next_token,    // output: greedy argmax
-    InferenceEngine& eng,
-    cudaStream_t s_main,    // primary stream
-    cudaStream_t s_k,       // K-projection auxiliary
-    cudaStream_t s_v_gate)  // V-projection + up-projection auxiliary
-{
-    const int d   = model.cfg.d_model;
-    const int dff = model.cfg.d_ff;
-    const int nh  = model.cfg.n_heads;
-    const int dph = d / nh;
-
-    // Named views into d_ovl_buf (see layout in model.h)
-    float* g_hidden  = d_ovl_buf;
-    float* g_normed  = d_ovl_buf + d;
-    float* g_q       = d_ovl_buf + 2 * d;
-    float* g_k       = d_ovl_buf + 3 * d;
-    float* g_v       = d_ovl_buf + 4 * d;
-    float* g_attn    = d_ovl_buf + 5 * d;
-    float* g_mlp_acc = d_ovl_buf + 6 * d;
-    float* g_gate    = d_ovl_buf + 7 * d;
-    float* g_up      = d_ovl_buf + 7 * d + dff;
-
-    cudaEvent_t ev0 = eng.ovl_events[0];   // RMSNorm done / Q done
-    cudaEvent_t ev1 = eng.ovl_events[1];   // K done / gate done
-    cudaEvent_t ev2 = eng.ovl_events[2];   // V done / up  done
-
-    // smem for RMSNorm kernels (warp-reduction scratch)
-    const size_t smem_red = (BLOCK_THREADS / WARP_SIZE) * sizeof(float);
-
-    // Block counts for multi-block GEMV: one thread per output column.
-    // Falls back to 1 block for tiny dummy models (d < BLOCK_THREADS).
-    const int nb_d   = (d   + BLOCK_THREADS - 1) / BLOCK_THREADS;  // QKV / Wo
-    const int nb_dff = (dff + BLOCK_THREADS - 1) / BLOCK_THREADS;  // gate / up
-
-    // ---- Embedding lookup ----
-    embed_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-        model, token_id, g_hidden);
-
-    for (int l = 0; l < model.cfg.n_layers; l++) {
-        const LayerWeights& lw = model.layers[l];
-
-        // ================================================================
-        // Attention sub-layer
-        // ================================================================
-
-        // -- RMSNorm (attn) --
-        rmsnorm_global_kernel<<<1, BLOCK_THREADS, smem_red, s_main>>>(
-            g_hidden, lw.rms_attn_weight, g_normed, d);
-        CUDA_CHECK(cudaEventRecord(ev0, s_main));    // normed ready
-
-        // Tell K and V streams to wait for normed
-        CUDA_CHECK(cudaStreamWaitEvent(s_k,      ev0, 0));
-        CUDA_CHECK(cudaStreamWaitEvent(s_v_gate, ev0, 0));
-
-        // -- Q || K || V projections (three-way parallel, multi-block) --
-        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_main>>>(
-            g_normed, lw.Wq, g_q, d, d);                       // Q on s_main
-        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_k>>>(
-            g_normed, lw.Wk, g_k, d, d);                       // K on s_k
-        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_v_gate>>>(
-            g_normed, lw.Wv, g_v, d, d);                       // V on s_v_gate
-
-        CUDA_CHECK(cudaEventRecord(ev1, s_k));       // K done
-        CUDA_CHECK(cudaEventRecord(ev2, s_v_gate));  // V done
-
-        // -- RoPE: needs Q (s_main) and K (ev1) done --
-        CUDA_CHECK(cudaStreamWaitEvent(s_main, ev1, 0));
-        rope_qk_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            g_q, g_k, nh, dph, seq_pos, model.cfg.rope_theta);
-
-        // -- KV cache write: needs RoPE'd K and V (ev2) done --
-        CUDA_CHECK(cudaStreamWaitEvent(s_main, ev2, 0));
-        kv_write_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            kv, l, g_k, g_v, seq_pos);
-
-        // -- Flash attention (Q from global memory, causal mask to seq_pos+1) --
-        flash_attn_global_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            g_q, g_attn, kv, l, d, nh, seq_pos + 1,
-            rsqrtf((float)dph));
-
-        // -- Wo projection + residual add (multi-block) --
-        gemv_mb_kernel<<<nb_d, BLOCK_THREADS, 0, s_main>>>(
-            g_attn, lw.Wo, g_normed, d, d);        // g_normed = Wo * attn_out
-        residual_add_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            g_hidden, g_normed, d);                 // hidden += Wo_out
-
-        // ================================================================
-        // MLP sub-layer
-        // ================================================================
-
-        // -- RMSNorm (MLP) --
-        rmsnorm_global_kernel<<<1, BLOCK_THREADS, smem_red, s_main>>>(
-            g_hidden, lw.rms_mlp_weight, g_normed, d);
-        CUDA_CHECK(cudaEventRecord(ev0, s_main));    // MLP normed ready
-
-        // Tell up stream to wait for normed before starting its projection
-        CUDA_CHECK(cudaStreamWaitEvent(s_v_gate, ev0, 0));
-
-        // -- Gate || Up projections (two-way parallel, multi-block) --
-        gemv_mb_kernel<<<nb_dff, BLOCK_THREADS, 0, s_main>>>(
-            g_normed, lw.W_gate, g_gate, d, dff);   // gate on s_main
-        gemv_mb_kernel<<<nb_dff, BLOCK_THREADS, 0, s_v_gate>>>(
-            g_normed, lw.W_up,   g_up,  d, dff);    // up on s_v_gate
-
-        CUDA_CHECK(cudaEventRecord(ev2, s_v_gate));  // up done
-
-        // -- Fused SwiGLU + W_down → g_mlp_acc (needs gate and up done) --
-        CUDA_CHECK(cudaStreamWaitEvent(s_main, ev2, 0));
-        swiglu_down_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            g_gate, g_up, lw.W_down, g_mlp_acc, d, dff);
-
-        // -- Residual add --
-        residual_add_kernel<<<1, BLOCK_THREADS, 0, s_main>>>(
-            g_hidden, g_mlp_acc, d);
-    }
-
-    // ---- Output head: final RMSNorm → output_proj → argmax ----
-    const size_t smem_out = 2 * BLOCK_THREADS * sizeof(float);
-    cuda_configure_kernel_dynamic_smem(output_argmax_global_kernel, smem_out);
-    output_argmax_global_kernel<<<1, BLOCK_THREADS, smem_out, s_main>>>(
-        model, g_hidden, g_normed, g_logits, d_next_token);
 }
 
 // ============================================================================
@@ -1050,19 +612,6 @@ __global__ void batch_target_verify_kernel(
 }
 
 // Prefix-only save for the verify bonus slot (position k in a k+1 batch).
-__global__ void selfspec_bonus_prefix_save_kernel(
-        ModelWeights target_model, KVCache kv,
-        int token_id, int seq_len, int n_prefix_layers,
-        float* g_saved_hidden) {
-    extern __shared__ float shared[];
-    int d = target_model.cfg.d_model;
-    float* hidden = shared;
-    float* smem   = shared + d;
-    model_forward_draft_prefix_save(
-        target_model, kv, token_id, seq_len, n_prefix_layers,
-        hidden, g_saved_hidden, smem);
-}
-
 __global__ void selfspec_bonus_prefix_save_dptr_kernel(
         ModelWeights target_model, KVCache kv,
         const int* d_token_id, int seq_len, int n_prefix_layers,
@@ -1181,6 +730,620 @@ __global__ void batch_target_verify_coop_selfspec_kernel(
     if (threadIdx.x == 0) out_tokens[b] = next;
 }
 
+// ============================================================================
+// cuBLAS prefill utility kernels  (global kernels on global-memory buffers)
+//
+// These are ONLY used by the host-orchestrated cuBLAS prefill path.
+// The legacy device-internal paths use the __device__ functions in model.cu.
+// ============================================================================
+
+// Batched embedding: g_hidden[M, d] from token_ids[M]
+__global__ void cublas_embed_kernel(const half* token_embedding, const int* token_ids,
+                                    float* g_hidden, int d, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = idx / d, col = idx % d;
+    if (m < M)
+        g_hidden[m * d + col] = __half2float(token_embedding[token_ids[m] * d + col]);
+}
+
+// Batched RMSNorm: g_out[M, d] = RMSNorm(g_in[M, d], weight[d])
+// One block per token. smem: input[d] + reduction[WARP_SIZE]
+__global__ void cublas_rmsnorm_kernel(const float* g_in, const half* weight,
+                                      float* g_out, int d, int M) {
+    int m = blockIdx.x;
+    if (m >= M) return;
+    const float* x = g_in + (size_t)m * d;
+    float* out = g_out + (size_t)m * d;
+    extern __shared__ float s_rms[];
+    float* s_red = s_rms + d;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x)
+        s_rms[i] = x[i];
+    __syncthreads();
+
+    device_rmsnorm(s_rms, weight, out, d, s_red);
+}
+
+// Batched RoPE: apply RoPE in-place on g_x[M, n_heads * dph] with positions [pos_base, pos_base+M)
+__global__ void cublas_rope_kernel(float* g_x, int n_heads_x, int dph,
+                                   int pos_base, int M,
+                                   float rope_theta,
+                                   RopeScalingType scaling_type,
+                                   float scaling_factor) {
+    int m = blockIdx.x;
+    if (m >= M) return;
+    float* x = g_x + m * n_heads_x * dph;
+    extern __shared__ float s_rope[];
+
+    int total = n_heads_x * dph;
+    for (int i = threadIdx.x; i < total; i += blockDim.x)
+        s_rope[i] = x[i];
+    __syncthreads();
+
+    rope_apply_inplace(s_rope, n_heads_x, dph, pos_base + m,
+                       rope_theta, scaling_type, scaling_factor);
+
+    for (int i = threadIdx.x; i < total; i += blockDim.x)
+        x[i] = s_rope[i];
+}
+
+// Convert fp32 → fp16 for cuBLAS input
+__global__ void f32_to_f16_kernel(const float* src, half* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = __float2half(src[idx]);
+}
+
+// Batched KV cache append: write K[M, kd] and V[M, kd] to cache at positions [pos_base..pos_base+M)
+__global__ void cublas_kv_append_kernel(KVCache kv, int layer,
+                                        const float* g_k, const float* g_v,
+                                        int kd, int pos_base, int M) {
+    int m = blockIdx.x;
+    if (m >= M) return;
+    int pos = pos_base + m;
+    int bidx = pos / KV_BLOCK_SIZE, sl = pos % KV_BLOCK_SIZE;
+    int pb = kv.layers[layer].block_table[bidx];
+    half* base = kv.pool + (size_t)pb * 2 * KV_BLOCK_SIZE * kv.d_head;
+    half* k_dst = base + sl * kv.d_head;
+    half* v_dst = base + KV_BLOCK_SIZE * kv.d_head + sl * kv.d_head;
+
+    const float* k_src = g_k + m * kd;
+    const float* v_src = g_v + m * kd;
+    for (int i = threadIdx.x; i < kd; i += blockDim.x) {
+        k_dst[i] = __float2half(k_src[i]);
+        v_dst[i] = __float2half(v_src[i]);
+    }
+}
+
+// Batched residual add: g_hidden[M, d] += g_residual[M, d]
+__global__ void cublas_residual_add_kernel(float* g_hidden, const float* g_residual,
+                                           int d, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * d;
+    if (idx < total)
+        g_hidden[idx] += g_residual[idx];
+}
+
+// Broadcast-add bias: g_x[m, i] += bias[i]  (no-op when bias == nullptr)
+__global__ void cublas_add_bias_kernel(float* g_x, const half* bias, int M, int n) {
+    if (!bias) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * n;
+    if (idx < total)
+        g_x[idx] += __half2float(bias[idx % n]);
+}
+
+// Batched SwiGLU: out[i] = silu(gate[i]) * up[i]
+__global__ void cublas_swiglu_kernel(const float* gate, const float* up,
+                                     float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = gate[idx];
+        out[idx] = (g / (1.0f + expf(-g))) * up[idx];
+    }
+}
+
+// Argmax over g_logits[V] → d_out (single token, last position)
+__global__ void cublas_argmax_kernel(const float* g_logits, int V, int* d_out) {
+    extern __shared__ float s_arg[];
+    float* s_val = s_arg;
+    int* s_idx = (int*)(s_arg + blockDim.x);
+
+    float best_val = -FLT_MAX;
+    int best_idx = 0;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float v = g_logits[i];
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+    s_val[threadIdx.x] = best_val;
+    s_idx[threadIdx.x] = best_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (s_val[threadIdx.x + s] > s_val[threadIdx.x]) {
+                s_val[threadIdx.x] = s_val[threadIdx.x + s];
+                s_idx[threadIdx.x] = s_idx[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *d_out = s_idx[0];
+}
+
+// GQA-aware flash attention on a single token's Q against the KV cache.
+// One block per token (blockIdx.x = token index m).
+__global__ void cublas_attention_kernel(
+    const float* g_Q, float* g_attn_out,
+    KVCache kv, int layer,
+    int nh, int nkv, int dph, int kd,
+    int pos_base, int M)
+{
+    int m = blockIdx.x;
+    if (m >= M) return;
+
+    int tid = threadIdx.x;
+    int d   = nh * dph;
+    int total_len = pos_base + m + 1;
+    float scale   = rsqrtf((float)dph);
+
+    extern __shared__ float smem_a[];
+    float* s_q   = smem_a;
+    float* s_out = smem_a + d;
+    float* s_blk = smem_a + 2 * d;
+
+    const float* q_src = g_Q + (size_t)m * d;
+    for (int i = tid; i < d; i += blockDim.x)
+        s_q[i] = q_src[i];
+    for (int i = tid; i < d; i += blockDim.x)
+        s_out[i] = 0.f;
+    __syncthreads();
+
+    __shared__ float s_m, s_l, s_tm, s_alpha, s_inv;
+
+    device_flash_attention_gqa(
+        s_q, s_out, kv, layer,
+        nh, nkv, dph, total_len,
+        s_blk, s_m, s_l, s_tm, s_alpha, s_inv);
+
+    float* out_dst = g_attn_out + (size_t)m * d;
+    for (int i = tid; i < d; i += blockDim.x)
+        out_dst[i] = s_out[i];
+}
+
+// ============================================================================
+// Lazy-growth scratch allocator for cuBLAS forward paths.
+// Allocates on first call, grows (never shrinks) when M increases.
+// ============================================================================
+
+static void cublas_ensure_scratch(InferenceEngine& eng,
+                                  const ModelConfig& cfg, int M) {
+    const int d   = cfg.d_model;
+    const int kd  = kv_dim(cfg);
+    const int dff = cfg.d_ff;
+
+    size_t need_f = (size_t)M * (4*d + 2*kd + 2*dff);
+    size_t need16 = (size_t)M * d;
+    if ((size_t)M * dff > need16) need16 = (size_t)M * dff;
+
+    if (eng.cublas_buf_floats < need_f) {
+        if (eng.d_cublas_buf) { cudaFree(eng.d_cublas_buf); eng.d_cublas_buf = nullptr; }
+        CUDA_CHECK(cudaMalloc(&eng.d_cublas_buf, need_f * sizeof(float)));
+        eng.cublas_buf_floats = need_f;
+    }
+    if (eng.cublas_x16_halves < need16) {
+        if (eng.d_cublas_x16) { cudaFree(eng.d_cublas_x16); eng.d_cublas_x16 = nullptr; }
+        CUDA_CHECK(cudaMalloc(&eng.d_cublas_x16, need16 * sizeof(half)));
+        eng.cublas_x16_halves = need16;
+    }
+}
+
+// ============================================================================
+// Host-orchestrated cuBLAS forward pass.
+//
+// Handles prefill (M = prompt_len), decode (M = 1), and batched verify
+// (M = spec_k + 1).  Tokens are placed at KV positions
+// [seq_base, seq_base + M).
+//
+// When all_token_logits == false (prefill / decode):
+//   Final RMSNorm + output GEMM + argmax on the LAST token only.
+//   g_logits must hold vocab_size floats.
+//   d_out_tokens must hold 1 int.
+//
+// When all_token_logits == true (verify):
+//   Final RMSNorm + output GEMM + argmax on ALL M tokens.
+//   g_logits must hold M * vocab_size floats.
+//   d_out_tokens must hold M ints.
+// ============================================================================
+
+static void cublas_forward(const ModelWeights& model, KVCache& kv,
+                           const int* d_tokens, int M,
+                           int seq_base,
+                           float* g_logits, int* d_out_tokens,
+                           InferenceEngine& eng,
+                           bool all_token_logits = false) {
+    const int d   = model.cfg.d_model;
+    const int dff = model.cfg.d_ff;
+    const int nh  = model.cfg.n_heads;
+    const int nkv = model.cfg.n_kv_heads;
+    const int dph = d / nh;
+    const int kd  = nkv * dph;
+    const int V   = model.cfg.vocab_size;
+
+    cudaStream_t stream = eng.streams[0];
+    GemmBackend gb;
+    gb.init(eng.cublas, stream);
+
+    cublas_ensure_scratch(eng, model.cfg, M);
+
+    float* d_buf = eng.d_cublas_buf;
+    half*  d_x16 = eng.d_cublas_x16;
+
+    float* g_hidden = d_buf;
+    float* g_normed = g_hidden + (size_t)M * d;
+    float* g_Q      = g_normed + (size_t)M * d;
+    float* g_K      = g_Q      + (size_t)M * d;
+    float* g_V      = g_K      + (size_t)M * kd;
+    float* g_attn   = g_V      + (size_t)M * kd;
+    float* g_gate   = g_attn   + (size_t)M * d;
+    float* g_up     = g_gate   + (size_t)M * dff;
+
+    size_t rms_smem  = ((size_t)d + WARP_SIZE) * sizeof(float);
+    size_t attn_smem = ((size_t)2 * d + KV_BLOCK_SIZE) * sizeof(float) + 16;
+    int bk = 256;
+
+    auto cvt = [&](const float* s, half* dst, int n) {
+        f32_to_f16_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(s, dst, n);
+    };
+
+    // Embed
+    {
+        int n = M * d;
+        cublas_embed_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+            model.token_embedding, d_tokens, g_hidden, d, M);
+    }
+
+    // Layer loop
+    for (int l = 0; l < model.cfg.n_layers; l++) {
+        const LayerWeights& lw = model.layers[l];
+
+        cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden, lw.rms_attn_weight, g_normed, d, M);
+
+        cvt(g_normed, d_x16, M * d);
+        gemm_backend_gemm(gb, M, d,  d, d_x16, lw.Wq, g_Q);
+        gemm_backend_gemm(gb, M, kd, d, d_x16, lw.Wk, g_K);
+        gemm_backend_gemm(gb, M, kd, d, d_x16, lw.Wv, g_V);
+        if (lw.Wq_bias) {
+            int n = M * d;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(g_Q, lw.Wq_bias, M, d);
+        }
+        if (lw.Wk_bias) {
+            int n = M * kd;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(g_K, lw.Wk_bias, M, kd);
+        }
+        if (lw.Wv_bias) {
+            int n = M * kd;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(g_V, lw.Wv_bias, M, kd);
+        }
+
+        size_t rope_q_smem = (size_t)d  * sizeof(float);
+        size_t rope_k_smem = (size_t)kd * sizeof(float);
+        cublas_rope_kernel<<<M, BLOCK_THREADS, rope_q_smem, stream>>>(
+            g_Q, nh, dph, seq_base, M, model.cfg.rope_theta,
+            model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+        cublas_rope_kernel<<<M, BLOCK_THREADS, rope_k_smem, stream>>>(
+            g_K, nkv, dph, seq_base, M, model.cfg.rope_theta,
+            model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+
+        cublas_kv_append_kernel<<<M, BLOCK_THREADS, 0, stream>>>(
+            kv, l, g_K, g_V, kd, seq_base, M);
+
+        cublas_attention_kernel<<<M, BLOCK_THREADS, attn_smem, stream>>>(
+            g_Q, g_attn, kv, l, nh, nkv, dph, kd, seq_base, M);
+
+        cvt(g_attn, d_x16, M * d);
+        gemm_backend_gemm(gb, M, d, d, d_x16, lw.Wo, g_normed);
+        {
+            int n = M * d;
+            cublas_residual_add_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_hidden, g_normed, d, M);
+        }
+
+        cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden, lw.rms_mlp_weight, g_normed, d, M);
+
+        cvt(g_normed, d_x16, M * d);
+        gemm_backend_gemm(gb, M, dff, d, d_x16, lw.W_gate, g_gate);
+        gemm_backend_gemm(gb, M, dff, d, d_x16, lw.W_up,   g_up);
+
+        {
+            int n = M * dff;
+            cublas_swiglu_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_gate, g_up, g_gate, n);
+        }
+
+        cvt(g_gate, d_x16, M * dff);
+        gemm_backend_gemm(gb, M, d, dff, d_x16, lw.W_down, g_normed);
+        {
+            int n = M * d;
+            cublas_residual_add_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_hidden, g_normed, d, M);
+        }
+    }
+
+    // Final output
+    size_t arg_smem = (size_t)BLOCK_THREADS * (sizeof(float) + sizeof(int));
+
+    if (all_token_logits) {
+        // All M tokens: RMSNorm + output GEMM + per-token argmax
+        cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden, model.rms_final_weight, g_normed, d, M);
+        cvt(g_normed, d_x16, M * d);
+        gemm_backend_gemm(gb, M, V, d, d_x16, model.output_proj, g_logits);
+
+        for (int m = 0; m < M; m++) {
+            cublas_argmax_kernel<<<1, BLOCK_THREADS, arg_smem, stream>>>(
+                g_logits + (size_t)m * V, V, d_out_tokens + m);
+        }
+    } else {
+        // Last token only
+        cublas_rmsnorm_kernel<<<1, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden + (size_t)(M - 1) * d, model.rms_final_weight, g_normed, d, 1);
+        cvt(g_normed, d_x16, d);
+        gemm_backend_gemm(gb, 1, V, d, d_x16, model.output_proj, g_logits);
+
+        cublas_argmax_kernel<<<1, BLOCK_THREADS, arg_smem, stream>>>(
+            g_logits, V, d_out_tokens);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+static void cublas_forward_from_hidden(
+    const ModelWeights& model, KVCache& kv,
+    const float* g_saved_hiddens, int M,
+    int seq_base, int layer_start,
+    float* g_logits, int* d_out_tokens,
+    InferenceEngine& eng);
+
+// Run transformer layers [layer_start, layer_end) on g_hidden[M, d].
+// Caller must embed tokens into g_hidden when layer_start == 0.
+static void cublas_run_layer_range(
+    const ModelWeights& model, KVCache& kv,
+    int M, int seq_base, int layer_start, int layer_end,
+    float* g_hidden, float* g_normed, float* g_Q, float* g_K, float* g_V,
+    float* g_attn, float* g_gate, float* g_up,
+    half* d_x16, GemmBackend& gb, cudaStream_t stream, int bk)
+{
+    const int d   = model.cfg.d_model;
+    const int dff = model.cfg.d_ff;
+    const int nh  = model.cfg.n_heads;
+    const int nkv = model.cfg.n_kv_heads;
+    const int dph = d / nh;
+    const int kd  = nkv * dph;
+
+    size_t rms_smem  = ((size_t)d + WARP_SIZE) * sizeof(float);
+    size_t attn_smem = ((size_t)2 * d + KV_BLOCK_SIZE) * sizeof(float) + 16;
+
+    auto cvt = [&](const float* s, half* dst, int n) {
+        f32_to_f16_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(s, dst, n);
+    };
+
+    for (int l = layer_start; l < layer_end; l++) {
+        const LayerWeights& lw = model.layers[l];
+
+        cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden, lw.rms_attn_weight, g_normed, d, M);
+
+        cvt(g_normed, d_x16, M * d);
+        gemm_backend_gemm(gb, M, d,  d, d_x16, lw.Wq, g_Q);
+        gemm_backend_gemm(gb, M, kd, d, d_x16, lw.Wk, g_K);
+        gemm_backend_gemm(gb, M, kd, d, d_x16, lw.Wv, g_V);
+        if (lw.Wq_bias) {
+            int n = M * d;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_Q, lw.Wq_bias, M, d);
+        }
+        if (lw.Wk_bias) {
+            int n = M * kd;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_K, lw.Wk_bias, M, kd);
+        }
+        if (lw.Wv_bias) {
+            int n = M * kd;
+            cublas_add_bias_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_V, lw.Wv_bias, M, kd);
+        }
+
+        size_t rope_q_smem = (size_t)d  * sizeof(float);
+        size_t rope_k_smem = (size_t)kd * sizeof(float);
+        cublas_rope_kernel<<<M, BLOCK_THREADS, rope_q_smem, stream>>>(
+            g_Q, nh, dph, seq_base, M, model.cfg.rope_theta,
+            model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+        cublas_rope_kernel<<<M, BLOCK_THREADS, rope_k_smem, stream>>>(
+            g_K, nkv, dph, seq_base, M, model.cfg.rope_theta,
+            model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+
+        cublas_kv_append_kernel<<<M, BLOCK_THREADS, 0, stream>>>(
+            kv, l, g_K, g_V, kd, seq_base, M);
+
+        cublas_attention_kernel<<<M, BLOCK_THREADS, attn_smem, stream>>>(
+            g_Q, g_attn, kv, l, nh, nkv, dph, kd, seq_base, M);
+
+        cvt(g_attn, d_x16, M * d);
+        gemm_backend_gemm(gb, M, d, d, d_x16, lw.Wo, g_normed);
+        {
+            int n = M * d;
+            cublas_residual_add_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_hidden, g_normed, d, M);
+        }
+
+        cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+            g_hidden, lw.rms_mlp_weight, g_normed, d, M);
+
+        cvt(g_normed, d_x16, M * d);
+        gemm_backend_gemm(gb, M, dff, d, d_x16, lw.W_gate, g_gate);
+        gemm_backend_gemm(gb, M, dff, d, d_x16, lw.W_up,   g_up);
+
+        {
+            int n = M * dff;
+            cublas_swiglu_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_gate, g_up, g_gate, n);
+        }
+
+        cvt(g_gate, d_x16, M * dff);
+        gemm_backend_gemm(gb, M, d, dff, d_x16, lw.W_down, g_normed);
+        {
+            int n = M * d;
+            cublas_residual_add_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+                g_hidden, g_normed, d, M);
+        }
+    }
+}
+
+// Embed + prefix layers [0, n_prefix_layers); write post-prefix hidden to g_saved.
+static void cublas_prefix_save(
+    const ModelWeights& model, KVCache& kv,
+    const int* d_tokens, int M, int seq_base, int n_prefix_layers,
+    float* g_saved_hidden, InferenceEngine& eng)
+{
+    const int d = model.cfg.d_model;
+
+    cudaStream_t stream = eng.streams[0];
+    GemmBackend gb;
+    gb.init(eng.cublas, stream);
+
+    cublas_ensure_scratch(eng, model.cfg, M);
+
+    float* d_buf = eng.d_cublas_buf;
+    half*  d_x16 = eng.d_cublas_x16;
+
+    float* g_hidden = d_buf;
+    float* g_normed = g_hidden + (size_t)M * d;
+    float* g_Q      = g_normed + (size_t)M * d;
+    float* g_K      = g_Q      + (size_t)M * d;
+    const int kd    = kv_dim(model.cfg);
+    float* g_V      = g_K      + (size_t)M * kd;
+    float* g_attn   = g_V      + (size_t)M * kd;
+    float* g_gate   = g_attn   + (size_t)M * d;
+    float* g_up     = g_gate   + (size_t)M * model.cfg.d_ff;
+
+    int bk = 256;
+    {
+        int n = M * d;
+        cublas_embed_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(
+            model.token_embedding, d_tokens, g_hidden, d, M);
+    }
+
+    cublas_run_layer_range(model, kv, M, seq_base, 0, n_prefix_layers,
+                           g_hidden, g_normed, g_Q, g_K, g_V, g_attn,
+                           g_gate, g_up, d_x16, gb, stream, bk);
+
+    CUDA_CHECK(cudaMemcpyAsync(g_saved_hidden, g_hidden,
+                               (size_t)M * d * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+// Self-spec greedy draft via cuBLAS: k chained proposals + bonus prefix save.
+static void cublas_selfspec_draft_greedy(
+    const ModelWeights& model, KVCache& kv,
+    int first_token, int k, int start_seq_len, int n_prefix_layers,
+    float* g_logits_scratch, float* d_saved_hiddens, int* d_draft_tokens,
+    int* d_tok_buf, InferenceEngine& eng)
+{
+    int cur = first_token;
+    for (int i = 0; i < k; i++) {
+        CUDA_CHECK(cudaMemcpy(d_tok_buf, &cur, sizeof(int),
+                              cudaMemcpyHostToDevice));
+        cublas_prefix_save(model, kv, d_tok_buf, 1, start_seq_len + i,
+                           n_prefix_layers,
+                           d_saved_hiddens + (size_t)i * model.cfg.d_model,
+                           eng);
+        cublas_forward_from_hidden(
+            model, kv,
+            d_saved_hiddens + (size_t)i * model.cfg.d_model,
+            1, start_seq_len + i, n_prefix_layers,
+            g_logits_scratch, d_draft_tokens + i, eng);
+        CUDA_CHECK(cudaMemcpy(&cur, d_draft_tokens + i, sizeof(int),
+                              cudaMemcpyDeviceToHost));
+    }
+    if (k > 0) {
+        CUDA_CHECK(cudaMemcpy(d_tok_buf, &cur, sizeof(int),
+                              cudaMemcpyHostToDevice));
+        cublas_prefix_save(model, kv, d_tok_buf, 1, start_seq_len + k,
+                           n_prefix_layers,
+                           d_saved_hiddens + (size_t)k * model.cfg.d_model,
+                           eng);
+    }
+}
+
+// Self-spec cuBLAS verify: starts from saved hidden states, runs layers
+// [layer_start, n_layers), then output head on all M tokens.
+static void cublas_forward_from_hidden(
+    const ModelWeights& model, KVCache& kv,
+    const float* g_saved_hiddens, int M,
+    int seq_base, int layer_start,
+    float* g_logits, int* d_out_tokens,
+    InferenceEngine& eng) {
+    const int d   = model.cfg.d_model;
+    const int dff = model.cfg.d_ff;
+    const int nh  = model.cfg.n_heads;
+    const int nkv = model.cfg.n_kv_heads;
+    const int dph = d / nh;
+    const int kd  = nkv * dph;
+    const int V   = model.cfg.vocab_size;
+
+    cudaStream_t stream = eng.streams[0];
+    GemmBackend gb;
+    gb.init(eng.cublas, stream);
+
+    cublas_ensure_scratch(eng, model.cfg, M);
+
+    float* d_buf = eng.d_cublas_buf;
+    half*  d_x16 = eng.d_cublas_x16;
+
+    float* g_hidden = d_buf;
+    float* g_normed = g_hidden + (size_t)M * d;
+    float* g_Q      = g_normed + (size_t)M * d;
+    float* g_K      = g_Q      + (size_t)M * d;
+    float* g_V      = g_K      + (size_t)M * kd;
+    float* g_attn   = g_V      + (size_t)M * kd;
+    float* g_gate   = g_attn   + (size_t)M * d;
+    float* g_up     = g_gate   + (size_t)M * dff;
+
+    size_t rms_smem  = ((size_t)d + WARP_SIZE) * sizeof(float);
+    int bk = 256;
+
+    auto cvt = [&](const float* s, half* dst, int n) {
+        f32_to_f16_kernel<<<(n+bk-1)/bk, bk, 0, stream>>>(s, dst, n);
+    };
+
+    // Load saved hidden states
+    CUDA_CHECK(cudaMemcpyAsync(g_hidden, g_saved_hiddens,
+                               (size_t)M * d * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream));
+
+    cublas_run_layer_range(model, kv, M, seq_base, layer_start,
+                           model.cfg.n_layers,
+                           g_hidden, g_normed, g_Q, g_K, g_V, g_attn,
+                           g_gate, g_up, d_x16, gb, stream, bk);
+
+    // Output on all M tokens
+    cublas_rmsnorm_kernel<<<M, BLOCK_THREADS, rms_smem, stream>>>(
+        g_hidden, model.rms_final_weight, g_normed, d, M);
+    cvt(g_normed, d_x16, M * d);
+    gemm_backend_gemm(gb, M, V, d, d_x16, model.output_proj, g_logits);
+
+    size_t arg_smem = (size_t)BLOCK_THREADS * (sizeof(float) + sizeof(int));
+    for (int m = 0; m < M; m++) {
+        cublas_argmax_kernel<<<1, BLOCK_THREADS, arg_smem, stream>>>(
+            g_logits + (size_t)m * V, V, d_out_tokens + m);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 // ---- Baseline (multi-kernel) ----
 
 // Forward declaration — full definition appears later in this file.
@@ -1203,16 +1366,12 @@ void multikernel_baseline(const ModelWeights& target_model,
     // h_prompt is a HOST pointer — values are read on CPU for each kernel launch.
     int max_new = params.max_new_tokens;
 
-    bool use_coop = (eng != nullptr && eng->coop_supported);
-
-    // Use intra-layer Q/K/V and gate/up stream overlap for prefill when the
-    // engine is available and the model is large enough to benefit.
-    const bool use_ovl_prefill = (eng != nullptr &&
-                                  target_model.cfg.d_model >= OVERLAP_MIN_D);
+    bool use_cublas = (eng != nullptr && eng->gemm_backend == GEMM_BACKEND_CUBLAS);
+    bool use_coop   = (eng != nullptr && eng->coop_supported) && !use_cublas;
 
     // Dynamic smem and logits buffer sized for the target model
     size_t smem_bytes = compute_smem_bytes(target_model.cfg);
-    if (!use_coop && !use_ovl_prefill)
+    if (!use_coop && !use_cublas)
         cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, smem_bytes);
 
     float* g_logits;
@@ -1221,49 +1380,46 @@ void multikernel_baseline(const ModelWeights& target_model,
 
     int* d_next_token;
     int* d_output;
+    int* d_tok_buf = nullptr;
     CUDA_CHECK(cudaMalloc(&d_next_token, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_output, MAX_SEQ_LEN * sizeof(int)));
+    if (use_cublas)
+        CUDA_CHECK(cudaMalloc(&d_tok_buf, sizeof(int)));
 
     kv_cache_reset(target_kv);
     int seq_len = 0;
 
-    // Prefill: process each prompt token
-    // Overlapped path: Q, K, V on streams[0,2,3]; gate, up share streams[0,3].
-    // Cooperative path: multi-block output-projection parallelism (decode phase).
-    // Fallback: single-block sequential kernel.
-    for (int i = 0; i < prompt_len; i++) {
-        if (use_ovl_prefill) {
-            launch_prefill_overlapped(
-                target_model, target_kv, h_prompt[i], seq_len,
-                eng->d_ovl_buf[0],          // target uses slot 0
-                g_logits, d_next_token, *eng,
-                eng->streams[0],            // s_main
-                eng->streams[2],            // s_k  (K projection)
-                eng->streams[3]);           // s_v_gate (V + up)
-            seq_len++;
-            set_seq_len_kernel<<<1, 1, 0, eng->streams[0]>>>(
-                target_kv.seq_len, seq_len);
-        } else if (use_coop) {
-            launch_cooperative_decode_step(
-                target_model, target_kv, h_prompt[i], seq_len,
-                eng->d_coop_hidden, eng->d_coop_scratch,
-                g_logits, d_next_token, eng->max_coop_blocks);
-            seq_len++;
-            set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, seq_len);
-        } else {
-            single_token_decode_kernel<<<1, BLOCK_THREADS, smem_bytes>>>(
-                target_model, target_kv, h_prompt[i], seq_len,
-                g_logits, d_next_token);
-            seq_len++;
-            set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, seq_len);
-        }
-    }
+    // Prefill: cuBLAS path batches all prompt tokens through tensor-core GEMMs;
+    // legacy path processes one token at a time.
+    if (use_cublas && prompt_len > 0) {
+        int* d_prompt;
+        CUDA_CHECK(cudaMalloc(&d_prompt, prompt_len * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int),
+                              cudaMemcpyHostToDevice));
 
-    // Drain the overlap streams before any D2H transfer.
-    if (use_ovl_prefill) {
-        CUDA_CHECK(cudaStreamSynchronize(eng->streams[0]));
-        CUDA_CHECK(cudaStreamSynchronize(eng->streams[2]));
-        CUDA_CHECK(cudaStreamSynchronize(eng->streams[3]));
+        cublas_forward(target_model, target_kv, d_prompt, prompt_len,
+                       0, g_logits, d_next_token, *eng);
+        seq_len = prompt_len;
+        set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, seq_len);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(d_prompt);
+    } else {
+        for (int i = 0; i < prompt_len; i++) {
+            if (use_coop) {
+                launch_cooperative_decode_step(
+                    target_model, target_kv, h_prompt[i], seq_len,
+                    eng->d_coop_hidden, eng->d_coop_scratch,
+                    g_logits, d_next_token, eng->max_coop_blocks);
+                seq_len++;
+                set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, seq_len);
+            } else {
+                single_token_decode_kernel<<<1, BLOCK_THREADS, smem_bytes>>>(
+                    target_model, target_kv, h_prompt[i], seq_len,
+                    g_logits, d_next_token);
+                seq_len++;
+                set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, seq_len);
+            }
+        }
     }
 
     int generated = 0;
@@ -1278,7 +1434,12 @@ void multikernel_baseline(const ModelWeights& target_model,
         generated++;
         if ((params.eos_token >= 0 && current_token == params.eos_token) || generated >= max_new) break;
 
-        if (use_coop) {
+        if (use_cublas) {
+            CUDA_CHECK(cudaMemcpy(d_tok_buf, &current_token, sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            cublas_forward(target_model, target_kv, d_tok_buf, 1,
+                           seq_len, g_logits, d_next_token, *eng);
+        } else if (use_coop) {
             launch_cooperative_decode_step(
                 target_model, target_kv, current_token, seq_len,
                 eng->d_coop_hidden, eng->d_coop_scratch,
@@ -1301,6 +1462,7 @@ void multikernel_baseline(const ModelWeights& target_model,
     cudaFree(g_logits);
     cudaFree(d_next_token);
     cudaFree(d_output);
+    if (d_tok_buf) cudaFree(d_tok_buf);
 }
 
 // ============================================================================
@@ -1445,18 +1607,6 @@ __global__ void cooperative_decode_kernel(
     }
 }
 
-// Second declaration (no new default arguments; first decl is before
-// multikernel_baseline, which already specifies stream = nullptr).
-static void launch_cooperative_decode_step(
-    const ModelWeights& model, KVCache& kv,
-    int token_id, int seq_len,
-    float* g_coop_hidden,
-    float* g_coop_scratch,
-    float* g_logits,
-    int*   d_next_token,
-    int    max_coop_blocks,
-    cudaStream_t stream);
-
 // ---- Speculative (multi-kernel) ----
 
 void multikernel_speculative(const ModelWeights& draft_model,
@@ -1471,21 +1621,25 @@ void multikernel_speculative(const ModelWeights& draft_model,
     int max_new = params.max_new_tokens;
     int k       = params.spec_k;
 
-    bool use_coop_draft  = (eng != nullptr && eng->coop_supported);
-    bool use_coop_target = (eng != nullptr && eng->coop_supported);
-    bool use_coop_verify = (eng != nullptr && eng->coop_supported);
+    // cuBLAS when requested (baseline uses multikernel_baseline separately).
+    bool use_cublas = (eng != nullptr && eng->gemm_backend == GEMM_BACKEND_CUBLAS);
+    bool use_coop_draft  = (eng != nullptr && eng->coop_supported) && !use_cublas;
+    bool use_coop_target = (eng != nullptr && eng->coop_supported) && !use_cublas;
+    bool use_coop_verify = (eng != nullptr && eng->coop_supported) && !use_cublas;
 
     // Each model gets its own smem budget and logits buffer
     size_t draft_smem  = compute_smem_bytes(draft_model.cfg);
     size_t target_smem = compute_smem_bytes(target_model.cfg);
     size_t max_decode_smem = draft_smem > target_smem ? draft_smem : target_smem;
 
-    if (!use_coop_draft && !use_coop_target)
-        cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, max_decode_smem);
-    else if (!use_coop_draft)
-        cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, draft_smem);
-    else if (!use_coop_target)
-        cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, target_smem);
+    if (!use_cublas) {
+        if (!use_coop_draft && !use_coop_target)
+            cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, max_decode_smem);
+        else if (!use_coop_draft)
+            cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, draft_smem);
+        else if (!use_coop_target)
+            cuda_configure_kernel_dynamic_smem(single_token_decode_kernel, target_smem);
+    }
 
     float* g_logits_draft;
     float* g_logits_target;
@@ -1496,8 +1650,11 @@ void multikernel_speculative(const ModelWeights& draft_model,
 
     int* d_next;
     int* d_output;
+    int* d_tok_buf = nullptr;
     CUDA_CHECK(cudaMalloc(&d_next, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_output, MAX_SEQ_LEN * sizeof(int)));
+    if (use_cublas)
+        CUDA_CHECK(cudaMalloc(&d_tok_buf, sizeof(int)));
 
     kv_cache_reset(draft_kv);
     if (!params.self_speculative)
@@ -1510,56 +1667,65 @@ void multikernel_speculative(const ModelWeights& draft_model,
     // Self-spec uses one shared cache: target full prefill only (draft layers are
     // a prefix of the same KV entries written during verify each round).
     if (params.self_speculative) {
-        cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
-        const bool use_ovl_target = (eng != nullptr &&
-                                     target_model.cfg.d_model >= OVERLAP_MIN_D);
-        const bool use_coop_tgt = use_coop_target;
-        for (int i = 0; i < prompt_len; i++) {
-            if (use_ovl_target) {
-                launch_prefill_overlapped(
-                    target_model, target_kv, h_prompt[i], target_seq,
-                    eng->d_ovl_buf[0], g_logits_target, d_next, *eng,
-                    eng->streams[1], eng->streams[2], eng->streams[3]);
-            } else if (use_coop_tgt) {
-                launch_cooperative_decode_step(
-                    target_model, target_kv, h_prompt[i], target_seq,
-                    eng->d_coop_hidden, eng->d_coop_scratch,
-                    g_logits_target, d_next, eng->max_coop_blocks, stream_t);
-            } else {
-                single_token_decode_kernel<<<1, BLOCK_THREADS, target_smem, stream_t>>>(
-                    target_model, target_kv, h_prompt[i], target_seq,
-                    g_logits_target, d_next);
+        if (use_cublas && prompt_len > 0) {
+            int* d_prompt;
+            CUDA_CHECK(cudaMalloc(&d_prompt, prompt_len * sizeof(int)));
+            CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            cublas_forward(target_model, target_kv, d_prompt, prompt_len,
+                           0, g_logits_target, d_next, *eng);
+            target_seq = prompt_len;
+            set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, target_seq);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            cudaFree(d_prompt);
+        } else if (!use_cublas) {
+            cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
+            const bool use_coop_tgt = (eng != nullptr && eng->coop_supported);
+            for (int i = 0; i < prompt_len; i++) {
+                if (use_coop_tgt) {
+                    launch_cooperative_decode_step(
+                        target_model, target_kv, h_prompt[i], target_seq,
+                        eng->d_coop_hidden, eng->d_coop_scratch,
+                        g_logits_target, d_next, eng->max_coop_blocks, stream_t);
+                } else {
+                    single_token_decode_kernel<<<1, BLOCK_THREADS, target_smem, stream_t>>>(
+                        target_model, target_kv, h_prompt[i], target_seq,
+                        g_logits_target, d_next);
+                }
+                target_seq++;
+                set_seq_len_kernel<<<1, 1, 0, stream_t>>>(target_kv.seq_len, target_seq);
             }
-            target_seq++;
-            set_seq_len_kernel<<<1, 1, 0, stream_t>>>(target_kv.seq_len, target_seq);
+            if (eng != nullptr)
+                CUDA_CHECK(cudaStreamSynchronize(stream_t));
         }
-        if (eng != nullptr)
-            CUDA_CHECK(cudaStreamSynchronize(stream_t));
         draft_seq = target_seq;
+    } else if (use_cublas && prompt_len > 0) {
+        // Sequential cuBLAS prefill: draft then target (both use stream[0]).
+        int* d_prompt;
+        CUDA_CHECK(cudaMalloc(&d_prompt, prompt_len * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int),
+                              cudaMemcpyHostToDevice));
+
+        cublas_forward(draft_model, draft_kv, d_prompt, prompt_len,
+                       0, g_logits_draft, d_next, *eng);
+        draft_seq = prompt_len;
+        set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+
+        cublas_forward(target_model, target_kv, d_prompt, prompt_len,
+                       0, g_logits_target, d_next, *eng);
+        target_seq = prompt_len;
+        set_seq_len_kernel<<<1, 1>>>(target_kv.seq_len, target_seq);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaFree(d_prompt);
     } else {
         // ---- Prefill: draft (stream[0]) and target (stream[1]) run in parallel ----
         cudaStream_t stream_d = (eng != nullptr) ? eng->streams[0] : nullptr;
         cudaStream_t stream_t = (eng != nullptr) ? eng->streams[1] : nullptr;
 
-        const bool use_ovl_draft  = (eng != nullptr &&
-                                      draft_model.cfg.d_model  >= OVERLAP_MIN_D);
-        const bool use_ovl_target = (eng != nullptr &&
-                                      target_model.cfg.d_model >= OVERLAP_MIN_D);
-
         for (int i = 0; i < prompt_len; i++) {
-        // Draft prefill on stream_d; uses d_ovl_buf[1] / d_coop_hidden2
+        // Draft prefill on stream_d; uses d_coop_hidden2
         // (separate buffer from target to avoid aliasing).
-        if (use_ovl_draft) {
-            launch_prefill_overlapped(
-                draft_model, draft_kv, h_prompt[i], draft_seq,
-                eng->d_ovl_buf[1],          // draft uses slot 1
-                g_logits_draft, d_next, *eng,
-                eng->streams[0],            // s_main
-                eng->streams[2],            // s_k
-                eng->streams[3]);           // s_v_gate
-            draft_seq++;
-            set_seq_len_kernel<<<1, 1, 0, stream_d>>>(draft_kv.seq_len, draft_seq);
-        } else if (use_coop_draft) {
+        if (use_coop_draft) {
             launch_cooperative_decode_step(
                 draft_model, draft_kv, h_prompt[i], draft_seq,
                 eng->d_coop_hidden2, eng->d_coop_scratch2,
@@ -1575,21 +1741,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
         }
 
         // Target prefill on stream_t (concurrent with draft's main stream).
-        // Intra-layer overlap for target also uses streams[2,3]; since draft's
-        // last kernel on those streams records ev1/ev2 and target's first
-        // use waits for ev0 (which fires AFTER the cross-stream sync below),
-        // there is no hazard as long as each step's sync fires in order.
-        if (use_ovl_target) {
-            launch_prefill_overlapped(
-                target_model, target_kv, h_prompt[i], target_seq,
-                eng->d_ovl_buf[0],          // target uses slot 0
-                g_logits_target, d_next, *eng,
-                eng->streams[1],            // s_main
-                eng->streams[2],            // s_k
-                eng->streams[3]);           // s_v_gate
-            target_seq++;
-            set_seq_len_kernel<<<1, 1, 0, stream_t>>>(target_kv.seq_len, target_seq);
-        } else if (use_coop_target) {
+        if (use_coop_target) {
             launch_cooperative_decode_step(
                 target_model, target_kv, h_prompt[i], target_seq,
                 eng->d_coop_hidden, eng->d_coop_scratch,
@@ -1605,9 +1757,6 @@ void multikernel_speculative(const ModelWeights& draft_model,
         }
 
         // Cross-stream sync: token i+1 can't start until both models finished token i.
-        // For the overlapped path the relevant "done" signal is on the s_main streams
-        // (streams[0] for draft, streams[1] for target); these carry all residual-add
-        // and seq_len writes, so recording ev[0/1] on them is sufficient.
         if (eng != nullptr) {
             CUDA_CHECK(cudaEventRecord(eng->sync_events[0], stream_d));
             CUDA_CHECK(cudaEventRecord(eng->sync_events[1], stream_t));
@@ -1621,10 +1770,6 @@ void multikernel_speculative(const ModelWeights& draft_model,
     if (eng != nullptr) {
         CUDA_CHECK(cudaStreamSynchronize(stream_d));
         CUDA_CHECK(cudaStreamSynchronize(stream_t));
-        if (use_ovl_draft || use_ovl_target) {
-            CUDA_CHECK(cudaStreamSynchronize(eng->streams[2]));
-            CUDA_CHECK(cudaStreamSynchronize(eng->streams[3]));
-        }
     }
     }
 
@@ -1660,8 +1805,6 @@ void multikernel_speculative(const ModelWeights& draft_model,
 
         int V_vocab = target_model.cfg.vocab_size;
 
-        cuda_configure_kernel_dynamic_smem(stochastic_draft_forward_sample_kernel,
-                                             draft_smem);
         cuda_configure_kernel_dynamic_smem(stochastic_draft_forward_sample_dptr_kernel,
                                              draft_smem);
         if (params.self_speculative)
@@ -1669,8 +1812,6 @@ void multikernel_speculative(const ModelWeights& draft_model,
                 stochastic_draft_forward_sample_save_dptr_kernel, draft_smem);
         cuda_configure_kernel_dynamic_smem(single_token_forward_logits_kernel,
                                            max_decode_smem);
-        cuda_configure_kernel_dynamic_smem(target_forward_prob_mass_kernel,
-                                           target_smem);
         cuda_configure_kernel_dynamic_smem(target_fwd_prob_and_accept_kernel,
                                            target_smem);
         if (params.self_speculative)
@@ -1680,18 +1821,13 @@ void multikernel_speculative(const ModelWeights& draft_model,
                                            0);
         cuda_configure_kernel_dynamic_smem(corrected_sample_adjusted_logits_kernel,
                                              0);
-        cuda_configure_kernel_dynamic_smem(stochastic_accept_gate_kernel, 0);
         cuda_configure_kernel_dynamic_smem(rng_init_kernel, 0);
 
         curandState* d_rng = nullptr;
-        float*       d_p_mass_out = nullptr;
-        float*       d_q_mass_out = nullptr;
         float*       d_corr_work = nullptr;
         int*         d_accept = nullptr;
 
         CUDA_CHECK(cudaMalloc(&d_rng, sizeof(curandState)));
-        CUDA_CHECK(cudaMalloc(&d_p_mass_out, sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_q_mass_out, sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_accept, sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_corr_work,
                               (size_t)V_vocab * 3 * sizeof(float)));
@@ -1730,33 +1866,46 @@ void multikernel_speculative(const ModelWeights& draft_model,
             int target_seq_save = target_seq;
             total_proposed += current_k;
 
-            // ---- Draft phase: fully chained on GPU, no per-step sync ----
-            // Seed: copy last_token to device so step 0 can read it as a pointer.
+            // ---- Draft phase ----
             CUDA_CHECK(cudaMemcpy(d_ctx_seed, &last_token, sizeof(int),
                                   cudaMemcpyHostToDevice));
             const int* d_ctx_ptr = d_ctx_seed;
 
-            for (int di = 0; di < current_k; di++) {
-                if (params.self_speculative) {
-                    stochastic_draft_forward_sample_save_dptr_kernel
-                        <<<1, BLOCK_THREADS, draft_smem>>>(
-                            target_model, draft_kv, d_ctx_ptr, draft_seq,
-                            params.n_draft_layers,
-                            draft_temp_dyn, d_rng, g_logits_draft,
-                            d_selfspec_hiddens +
-                                (size_t)di * target_model.cfg.d_model,
-                            d_draft_tokens_dev + di, d_q_probs_dev + di);
-                } else {
-                    stochastic_draft_forward_sample_dptr_kernel
-                        <<<1, BLOCK_THREADS, draft_smem>>>(
-                            draft_model, draft_kv, d_ctx_ptr, draft_seq,
-                            draft_temp_dyn, d_rng, g_logits_draft,
-                            d_draft_tokens_dev + di, d_q_probs_dev + di);
+            if (use_cublas && !params.self_speculative) {
+                for (int di = 0; di < current_k; di++) {
+                    cublas_forward(draft_model, draft_kv, d_ctx_ptr, 1,
+                                   draft_seq, g_logits_draft,
+                                   d_draft_tokens_dev + di, *eng);
+                    sample_from_logits_q_kernel<<<1, 1>>>(
+                        g_logits_draft, V_vocab, draft_temp_dyn, d_rng,
+                        d_draft_tokens_dev + di, d_q_probs_dev + di);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    d_ctx_ptr = d_draft_tokens_dev + di;
+                    draft_seq++;
+                    set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
                 }
-                // Chain: next step reads the token this step just wrote on device.
-                d_ctx_ptr = d_draft_tokens_dev + di;
-                draft_seq++;
-                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            } else {
+                for (int di = 0; di < current_k; di++) {
+                    if (params.self_speculative) {
+                        stochastic_draft_forward_sample_save_dptr_kernel
+                            <<<1, BLOCK_THREADS, draft_smem>>>(
+                                target_model, draft_kv, d_ctx_ptr, draft_seq,
+                                params.n_draft_layers,
+                                draft_temp_dyn, d_rng, g_logits_draft,
+                                d_selfspec_hiddens +
+                                    (size_t)di * target_model.cfg.d_model,
+                                d_draft_tokens_dev + di, d_q_probs_dev + di);
+                    } else {
+                        stochastic_draft_forward_sample_dptr_kernel
+                            <<<1, BLOCK_THREADS, draft_smem>>>(
+                                draft_model, draft_kv, d_ctx_ptr, draft_seq,
+                                draft_temp_dyn, d_rng, g_logits_draft,
+                                d_draft_tokens_dev + di, d_q_probs_dev + di);
+                    }
+                    d_ctx_ptr = d_draft_tokens_dev + di;
+                    draft_seq++;
+                    set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+                }
             }
             if (params.self_speculative && current_k > 0) {
                 selfspec_bonus_prefix_save_dptr_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
@@ -1783,7 +1932,17 @@ void multikernel_speculative(const ModelWeights& draft_model,
             for (int vi = 0; vi < current_k; vi++) {
                 int inp = (vi == 0) ? last_token : h_draft_tokens[vi - 1];
 
-                if (params.self_speculative) {
+                if (use_cublas && !params.self_speculative) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &inp, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_forward(target_model, target_kv, d_tok_buf, 1,
+                                   target_roll, g_logits_target, d_next, *eng);
+                    size_t accept_smem = (size_t)BLOCK_THREADS * sizeof(float);
+                    accept_from_logits_kernel<<<1, BLOCK_THREADS, accept_smem>>>(
+                        g_logits_target, V_vocab,
+                        h_draft_tokens[vi], h_q_probs[vi],
+                        d_rng, d_accept);
+                } else if (params.self_speculative) {
                     target_fwd_prob_and_accept_selfspec_kernel
                         <<<1, BLOCK_THREADS, target_smem>>>(
                             target_model, target_kv, inp, target_roll,
@@ -1825,11 +1984,19 @@ void multikernel_speculative(const ModelWeights& draft_model,
                                                  target_seq_save + vi);
                 }
 
-                single_token_forward_logits_kernel
-                    <<<1, BLOCK_THREADS, draft_smem>>>(
-                        draft_model, draft_kv, inp, draft_seq_save + vi,
-                        g_logits_draft);
-                CUDA_CHECK(cudaDeviceSynchronize());
+                if (use_cublas && !params.self_speculative) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &inp, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_forward(draft_model, draft_kv, d_tok_buf, 1,
+                                   draft_seq_save + vi, g_logits_draft,
+                                   d_next, *eng);
+                } else {
+                    single_token_forward_logits_kernel
+                        <<<1, BLOCK_THREADS, draft_smem>>>(
+                            draft_model, draft_kv, inp, draft_seq_save + vi,
+                            g_logits_draft);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
 
                 corrected_sample_adjusted_logits_kernel<<<1, 1>>>(
                     g_logits_target, g_logits_draft, V_vocab, d_rng, d_next,
@@ -1838,21 +2005,36 @@ void multikernel_speculative(const ModelWeights& draft_model,
                 CUDA_CHECK(cudaMemcpy(&bonus, d_next, sizeof(int),
                                       cudaMemcpyDeviceToHost));
 
-                single_token_forward_logits_kernel
-                    <<<1, BLOCK_THREADS, target_smem>>>(
-                        target_model, target_kv, bonus,
-                        target_seq_save + n_accept_round, g_logits_target);
-                CUDA_CHECK(cudaDeviceSynchronize());
+                if (use_cublas && !params.self_speculative) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &bonus, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_forward(target_model, target_kv, d_tok_buf, 1,
+                                   target_seq_save + n_accept_round,
+                                   g_logits_target, d_next, *eng);
+                } else {
+                    single_token_forward_logits_kernel
+                        <<<1, BLOCK_THREADS, target_smem>>>(
+                            target_model, target_kv, bonus,
+                            target_seq_save + n_accept_round, g_logits_target);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
 
                 break;
             }
 
             if (!broke_early) {
-                single_token_forward_logits_kernel
-                    <<<1, BLOCK_THREADS, target_smem>>>(
-                        target_model, target_kv, h_draft_tokens[current_k - 1],
-                        target_roll, g_logits_target);
-                CUDA_CHECK(cudaDeviceSynchronize());
+                if (use_cublas && !params.self_speculative) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &h_draft_tokens[current_k - 1],
+                                          sizeof(int), cudaMemcpyHostToDevice));
+                    cublas_forward(target_model, target_kv, d_tok_buf, 1,
+                                   target_roll, g_logits_target, d_next, *eng);
+                } else {
+                    single_token_forward_logits_kernel
+                        <<<1, BLOCK_THREADS, target_smem>>>(
+                            target_model, target_kv, h_draft_tokens[current_k - 1],
+                            target_roll, g_logits_target);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
 
                 softmax_sample_temperature_kernel<<<1, 1>>>(
                     g_logits_target, V_vocab, 1.f, d_rng, d_next);
@@ -1885,20 +2067,34 @@ void multikernel_speculative(const ModelWeights& draft_model,
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
 
                 if (n_accept_round == current_k) {
-                    cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
-                                                       draft_smem);
-                    single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                        draft_model, draft_kv, h_draft_tokens[current_k - 1],
-                        draft_seq, g_logits_draft, d_next);
+                    if (use_cublas) {
+                        CUDA_CHECK(cudaMemcpy(d_tok_buf, &h_draft_tokens[current_k - 1],
+                                              sizeof(int), cudaMemcpyHostToDevice));
+                        cublas_forward(draft_model, draft_kv, d_tok_buf, 1,
+                                       draft_seq, g_logits_draft, d_next, *eng);
+                    } else {
+                        cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
+                                                           draft_smem);
+                        single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                            draft_model, draft_kv, h_draft_tokens[current_k - 1],
+                            draft_seq, g_logits_draft, d_next);
+                    }
                     draft_seq++;
                     set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
                 }
 
-                cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
-                                                   draft_smem);
-                single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
-                    draft_model, draft_kv, last_token, draft_seq, g_logits_draft,
-                    d_next);
+                if (use_cublas) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &last_token, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_forward(draft_model, draft_kv, d_tok_buf, 1,
+                                   draft_seq, g_logits_draft, d_next, *eng);
+                } else {
+                    cuda_configure_kernel_dynamic_smem(single_token_decode_kernel,
+                                                       draft_smem);
+                    single_token_decode_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
+                        draft_model, draft_kv, last_token, draft_seq, g_logits_draft,
+                        d_next);
+                }
                 draft_seq++;
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
             }
@@ -1935,8 +2131,6 @@ void multikernel_speculative(const ModelWeights& draft_model,
         if (d_selfspec_hiddens_local) cudaFree(d_selfspec_hiddens_local);
         cudaFree(d_corr_work);
         cudaFree(d_accept);
-        cudaFree(d_q_mass_out);
-        cudaFree(d_p_mass_out);
         cudaFree(d_rng);
 
         write_result_kernel<<<1, BLOCK_THREADS>>>(
@@ -1949,6 +2143,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
         cudaFree(g_logits_target);
         cudaFree(d_next);
         cudaFree(d_output);
+        if (d_tok_buf) cudaFree(d_tok_buf);
         return;
     }
 
@@ -1981,7 +2176,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
         cuda_configure_kernel_dynamic_smem(batch_target_verify_kernel, target_smem);
     if (use_coop_verify)
         cuda_configure_kernel_dynamic_smem(batch_target_verify_coop_kernel, target_smem);
-    if (params.self_speculative) {
+    if (params.self_speculative && !use_cublas) {
         cuda_configure_kernel_dynamic_smem(batch_draft_selfspec_kernel, draft_smem);
         cuda_configure_kernel_dynamic_smem(batch_target_verify_selfspec_kernel,
                                            target_smem);
@@ -1994,11 +2189,13 @@ void multikernel_speculative(const ModelWeights& draft_model,
                               (size_t)max_B * d_t * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_batch_work,
                               (size_t)(7 * d_t + MLP_FF_TILE) * max_B * sizeof(float)));
+    } else if (params.self_speculative) {
+        cuda_configure_kernel_dynamic_smem(batch_draft_selfspec_kernel, draft_smem);
     }
 
-    // Batched verify logits (cooperative path or self-spec sequential batched verify)
+    // Batched verify logits (cooperative, self-spec, or cuBLAS verify)
     float* g_logits_verify_batch = nullptr;
-    if (use_coop_verify || params.self_speculative)
+    if (use_coop_verify || params.self_speculative || use_cublas)
         CUDA_CHECK(cudaMalloc(&g_logits_verify_batch,
                               (size_t)MAX_VERIFY_BATCH * target_model.cfg.vocab_size
                               * sizeof(float)));
@@ -2012,23 +2209,41 @@ void multikernel_speculative(const ModelWeights& draft_model,
         int target_seq_save = target_seq;
         total_proposed += current_k;
 
-        // ---- Draft phase: one batched kernel (k separate launches → 1) ----
-        if (params.self_speculative) {
+        // ---- Draft phase ----
+        if (use_cublas && params.self_speculative) {
+            cublas_selfspec_draft_greedy(
+                target_model, draft_kv, last_token, current_k, draft_seq,
+                params.n_draft_layers, g_logits_draft, d_selfspec_hiddens,
+                d_batch_draft, d_tok_buf, *eng);
+            draft_seq += current_k;
+        } else if (use_cublas && !params.self_speculative) {
+            // Chain k single-token cuBLAS forwards on the draft model.
+            CUDA_CHECK(cudaMemcpy(d_tok_buf, &last_token, sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            const int* d_ctx = d_tok_buf;
+            for (int di = 0; di < current_k; di++) {
+                cublas_forward(draft_model, draft_kv, d_ctx, 1,
+                               draft_seq, g_logits_draft,
+                               d_batch_draft + di, *eng);
+                d_ctx = d_batch_draft + di;
+                draft_seq++;
+                set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
+            }
+        } else if (params.self_speculative) {
             batch_draft_selfspec_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
                 target_model, draft_kv, last_token, current_k, draft_seq,
                 params.n_draft_layers,
                 g_logits_draft, d_selfspec_hiddens, d_batch_draft);
+            draft_seq += current_k;
+            // Shared KV: leave device seq_len at target_seq until verify completes.
         } else {
             batch_draft_greedy_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
                 draft_model, draft_kv, last_token, current_k, draft_seq,
                 g_logits_draft, d_batch_draft);
-        }
-        draft_seq += current_k;
-        if (!params.self_speculative) {
+            draft_seq += current_k;
             set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
         }
-        // Shared KV: leave device seq_len at target_seq until verify completes.
-        // D2H memcpy provides implicit sync; no separate DeviceSync needed
+        // D2H memcpy provides implicit sync
         CUDA_CHECK(cudaMemcpy(h_draft_tokens, d_batch_draft,
                               current_k * sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -2039,7 +2254,16 @@ void multikernel_speculative(const ModelWeights& draft_model,
         CUDA_CHECK(cudaMemcpy(d_batch_verify_in, h_verify_tokens,
                               batch_size * sizeof(int), cudaMemcpyHostToDevice));
 
-        if (params.self_speculative) {
+        if (use_cublas && params.self_speculative) {
+            cublas_forward_from_hidden(
+                target_model, target_kv, d_selfspec_hiddens, batch_size,
+                target_seq, params.n_draft_layers,
+                g_logits_verify_batch, d_batch_verify_out, *eng);
+        } else if (use_cublas) {
+            cublas_forward(target_model, target_kv, d_batch_verify_in, batch_size,
+                           target_seq, g_logits_verify_batch, d_batch_verify_out,
+                           *eng, /*all_token_logits=*/true);
+        } else if (params.self_speculative) {
             int n_dl = params.n_draft_layers;
             if (use_coop_verify) {
                 void* coop_args[] = {
@@ -2133,7 +2357,12 @@ void multikernel_speculative(const ModelWeights& draft_model,
             // When ALL k drafts were accepted, draft[k-1] was only a prediction —
             // its K/V was never written.  One extra forward fills that slot.
             if (n_accepted == current_k) {
-                if (use_coop_draft) {
+                if (use_cublas) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &h_draft_tokens[current_k - 1],
+                                          sizeof(int), cudaMemcpyHostToDevice));
+                    cublas_forward(draft_model, draft_kv, d_tok_buf, 1,
+                                   draft_seq, g_logits_draft, d_next, *eng);
+                } else if (use_coop_draft) {
                     launch_cooperative_decode_step(
                         draft_model, draft_kv, h_draft_tokens[current_k - 1],
                         draft_seq, eng->d_coop_hidden2, eng->d_coop_scratch2,
@@ -2147,7 +2376,12 @@ void multikernel_speculative(const ModelWeights& draft_model,
                 set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
             } else {
                 // Partial accept: write bonus token's K/V at the rollback position.
-                if (use_coop_draft) {
+                if (use_cublas) {
+                    CUDA_CHECK(cudaMemcpy(d_tok_buf, &last_token, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_forward(draft_model, draft_kv, d_tok_buf, 1,
+                                   draft_seq, g_logits_draft, d_next, *eng);
+                } else if (use_coop_draft) {
                     launch_cooperative_decode_step(
                         draft_model, draft_kv, last_token, draft_seq,
                         eng->d_coop_hidden2, eng->d_coop_scratch2,
@@ -2185,6 +2419,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
     cudaFree(g_logits_target);
     cudaFree(d_next);
     cudaFree(d_output);
+    if (d_tok_buf) cudaFree(d_tok_buf);
 }
 
 // ============================================================================

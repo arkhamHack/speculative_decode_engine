@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 // ============================================================================
 // Argument parsing
@@ -16,55 +17,79 @@ struct Args {
     bool   use_mega     = false;           // --mode=mega
     int    max_new      = 32;              // --max-tokens=N
     int    spec_k       = DEFAULT_SPEC_K;  // --k=N
-    unsigned seed       = 42;             // --seed=N
     int    prompt_len   = 4;              // --prompt-len=N  (dummy tokenizer only)
     bool   stochastic_spec = false;       // --stochastic-spec
     float  draft_temp   = 1.f;            // --draft-temp=T
     bool   adaptive_draft_temp = false;   // --adaptive-draft-temp
-    float  adapt_accept_target = 0.50f;   // --adapt-accept=R  ( EWMA centre, default 0.5 )
+    float  adapt_accept_target = 0.50f;   // --adapt-accept=R
     float  adapt_gain        = 0.055f;   // --adapt-gain=G
-    float  adapt_ewma_mix    = 0.25f;   // --adapt-ewma=M (smoothing λ on per-round rate)
+    float  adapt_ewma_mix    = 0.25f;   // --adapt-ewma=M
     unsigned spec_rng_seed = 12345;       // --spec-seed=N
-    int    eos_token        = -1;         // --eos-token=N  (HF eos_token_id; -1 = disabled)
+    int    eos_token        = -1;         // --eos-token=N
     char   draft_path[512]  = "";         // --draft=path/to/draft.bin
     char   target_path[512] = "";         // --target=path/to/target.bin
     char   prompt_tok[512]  = "";         // --prompt-tok=path/to/prompt.tok
-    char   output_tok[512]  = "";         // --output-tok=path  (write generated ids)
-    bool   self_spec        = false;      // --self-spec  (early layers draft, full model target)
-    int    draft_layers     = 0;          // --draft-layers=N  (default: target_n_layers / 2)
+    char   output_tok[512]  = "";         // --output-tok=path
+    bool   self_spec        = false;      // --self-spec
+    int    draft_layers     = 0;          // --draft-layers=N
+    GemmBackendType gemm_backend = GEMM_BACKEND_LEGACY;  // --gemm-backend=
+    bool   repl             = false;      // --repl  (keep weights loaded)
+    bool   spec_only        = false;      // --spec-only (skip baseline compare)
+    bool   bench            = false;      // --bench  (force baseline+spec compare)
 };
 
 static void usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "\n"
-        "Dummy-tokenizer mode (default, no model files needed):\n"
+        "Serving / interactive (weights stay resident):\n"
+        "  --repl                load models once, then accept many prompts\n"
+        "  --spec-only           generate with speculative decode only (no baseline)\n"
+        "  --bench               compare baseline vs speculative (default without --repl)\n"
+        "\n"
+        "Common options:\n"
         "  --mode=multi|mega     kernel path (default: multi)\n"
         "  --max-tokens=N        tokens to generate (default: 32)\n"
         "  --k=N                 speculative draft depth (default: %d)\n"
-        "  --seed=N              random weight seed (default: 42)\n"
         "  --prompt-len=N        dummy prompt length (default: 4)\n"
-        "  --stochastic-spec     distribution-matching speculative verify (mega + multi)\n"
+        "  --stochastic-spec     distribution-matching speculative verify\n"
         "  --draft-temp=T        draft softmax temperature (default: 1)\n"
         "  --adaptive-draft-temp EWMA nudge draft temp using --adapt-* heuristics\n"
         "  --adapt-accept=R      EWMA acceptance target ∈ (0,1), default 0.5\n"
         "  --adapt-gain=G        Δtemp per EWMA deviation step, default 0.055\n"
-        "  --adapt-ewma=M       mix weight for EWMA ∈ (0,1), default 0.25\n"
+        "  --adapt-ewma=M        mix weight for EWMA ∈ (0,1), default 0.25\n"
         "  --spec-seed=N         RNG seed for stochastic spec (default: 12345)\n"
-        "  --self-spec           self-speculative: early layers draft, full model target\n"
-        "  --draft-layers=N      layers 1..N as draft proposer (default: target_layers/2)\n"
+        "  --eos-token=N         stop generation on this token id\n"
+        "  --self-spec           early layers draft, full model target\n"
+        "  --draft-layers=N      layers 1..N as draft proposer (default: target/2)\n"
+        "  --gemm-backend=X      cublas | legacy (default)\n"
         "\n"
-        "Real-model mode (requires SDEC weight files + tokenised prompt):\n"
-        "  --draft=path.bin      draft model SDEC binary (from tools/export_model.py)\n"
+        "Real-model mode:\n"
+        "  --draft=path.bin      draft model SDEC binary\n"
         "  --target=path.bin     target model SDEC binary\n"
-        "  --prompt-tok=path.tok tokenised prompt (from tools/hf_tok.py encode)\n"
-        "  --output-tok=path.tok write generated token ids here (decode with Python)\n"
+        "  --prompt-tok=path.tok tokenised prompt (tools/hf_tok.py encode)\n"
+        "  --output-tok=path.tok write generated token ids\n"
         "\n"
-        "Tool scripts (in tools/):\n"
-        "  python tools/export_model.py <hf_model> <out.bin>   -- export HF model\n"
+        "REPL commands (when --repl):\n"
+        "  <path.tok>            run generation on that prompt file\n"
+        "  max-tokens N          change --max-tokens for subsequent runs\n"
+        "  k N                   change speculation depth\n"
+        "  output <path.tok>     set default --output-tok (empty clears)\n"
+        "  bench on|off          toggle baseline comparison\n"
+        "  help                  show REPL help\n"
+        "  quit | exit           unload models and exit\n"
+        "\n"
+        "Example (experimental vLLM-style session):\n"
+        "  %s --target=weights/m.bin --self-spec --gemm-backend=cublas --repl\n"
+        "  sdec> prompt.tok\n"
+        "  sdec> another.tok\n"
+        "  sdec> quit\n"
+        "\n"
+        "Tools:\n"
+        "  python tools/export_model.py <hf_model> -o out.bin\n"
         "  python tools/hf_tok.py encode <model> <text> <out.tok>\n"
         "  python tools/hf_tok.py decode <model> <in.tok>\n",
-        prog, DEFAULT_SPEC_K);
+        prog, DEFAULT_SPEC_K, prog);
 }
 
 static void parse_args(Args& args, int argc, char** argv) {
@@ -75,8 +100,6 @@ static void parse_args(Args& args, int argc, char** argv) {
             args.max_new = atoi(argv[i] + 13);
         } else if (strncmp(argv[i], "--k=", 4) == 0) {
             args.spec_k = atoi(argv[i] + 4);
-        } else if (strncmp(argv[i], "--seed=", 7) == 0) {
-            args.seed = (unsigned)atoi(argv[i] + 7);
         } else if (strcmp(argv[i], "--stochastic-spec") == 0) {
             args.stochastic_spec = true;
         } else if (strncmp(argv[i], "--draft-temp=", 13) == 0) {
@@ -108,6 +131,17 @@ static void parse_args(Args& args, int argc, char** argv) {
             args.self_spec = true;
         } else if (strncmp(argv[i], "--draft-layers=", 15) == 0) {
             args.draft_layers = atoi(argv[i] + 15);
+        } else if (strncmp(argv[i], "--gemm-backend=", 15) == 0) {
+            const char* val = argv[i] + 15;
+            if (strcmp(val, "cublas") == 0) args.gemm_backend = GEMM_BACKEND_CUBLAS;
+            else if (strcmp(val, "legacy") == 0) args.gemm_backend = GEMM_BACKEND_LEGACY;
+            else { fprintf(stderr, "Unknown gemm backend: %s\n", val); exit(1); }
+        } else if (strcmp(argv[i], "--repl") == 0) {
+            args.repl = true;
+        } else if (strcmp(argv[i], "--spec-only") == 0) {
+            args.spec_only = true;
+        } else if (strcmp(argv[i], "--bench") == 0) {
+            args.bench = true;
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); exit(0);
@@ -116,6 +150,10 @@ static void parse_args(Args& args, int argc, char** argv) {
             usage(argv[0]); exit(1);
         }
     }
+
+    // REPL implies serve mode (spec-only) unless --bench was requested.
+    if (args.repl && !args.bench)
+        args.spec_only = true;
 }
 
 // ============================================================================
@@ -130,232 +168,133 @@ static void print_tokens(const char* label, const int* tokens, int n) {
     printf("\n");
 }
 
+static void trim_inplace(char* s) {
+    char* start = s;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')
+        start++;
+    if (start != s) memmove(s, start, strlen(start) + 1);
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                     s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[--n] = '\0';
+    }
+}
+
 // ============================================================================
-// Main
+// Persistent session — models / KV / engine loaded once
 // ============================================================================
 
-int main(int argc, char** argv) {
-    Args args;
-    parse_args(args, argc, argv);
+struct Session {
+    Args             args;
+    bool             use_real       = false;
+    bool             draft_is_alias = false;
+    bool             kv_shared      = false;
+    bool             do_baseline    = true;   // false when --spec-only
 
-    // Print device info
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    printf("Device: %s (SM %d.%d, %d SMs, %.1f GB)\n",
-           prop.name, prop.major, prop.minor,
-           prop.multiProcessorCount,
-           prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    ModelWeights     draft_model{};
+    ModelWeights     target_model{};
+    KVCache          draft_kv{};
+    KVCache          target_kv{};
+    KVCache          baseline_kv{};
+    InferenceEngine  eng{};
 
-    // ---- Decide operating mode: real weights or dummy ----
-    bool use_real = (args.target_path[0] != '\0' &&
-                     (args.draft_path[0] != '\0' || args.self_spec));
-    if (args.self_spec && args.draft_path[0] == '\0' && args.target_path[0] != '\0') {
-        // Production self-spec: only --target= required; draft reuses same weights.
-        strncpy(args.draft_path, args.target_path, 511);
+    GenerationResult* d_baseline_result = nullptr;
+    GenerationResult* d_spec_result     = nullptr;
+    int*              d_prompt          = nullptr;  // capacity MAX_SEQ_LEN
+
+    GenerationParams params{};
+    cudaEvent_t      ev_start{}, ev_stop{};
+};
+
+static void session_fill_params(Session& s) {
+    s.params.max_new_tokens               = s.args.max_new;
+    s.params.spec_k                       = s.args.spec_k;
+    s.params.use_megakernel               = s.args.use_mega;
+    s.params.stochastic_spec_decode       = s.args.stochastic_spec;
+    s.params.draft_temperature            = s.args.draft_temp;
+    s.params.adaptive_draft_temperature   = s.args.adaptive_draft_temp;
+    s.params.stochastic_rng_seed          = s.args.spec_rng_seed;
+    s.params.stochastic_adapt_target_accept = s.args.adapt_accept_target;
+    s.params.stochastic_adapt_temp_gain   = s.args.adapt_gain;
+    s.params.stochastic_adapt_ewma_mix    = s.args.adapt_ewma_mix;
+    s.params.eos_token                    = s.args.eos_token;
+    s.params.self_speculative             = s.args.self_spec;
+    s.params.n_draft_layers               = s.draft_model.cfg.n_layers;
+}
+
+// Run one generation. Prompt must already be validated (1..MAX_SEQ_LEN).
+// Returns false on CUDA / logic failure (rare); true otherwise.
+static bool session_generate(Session& s, const int* h_prompt, int prompt_len,
+                             const char* output_tok_path) {
+    if (prompt_len <= 0 || prompt_len > MAX_SEQ_LEN) {
+        fprintf(stderr, "Invalid prompt length %d (max %d)\n",
+                prompt_len, MAX_SEQ_LEN);
+        return false;
     }
 
-    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d | stochastic_spec=%d",
-           use_real ? "real-model" : "dummy",
-           args.use_mega ? "megakernel" : "multi-kernel",
-           args.max_new, args.spec_k, args.stochastic_spec ? 1 : 0);
-    if (args.self_spec)
-        printf(" | self-spec");
-    printf("\n\n");
+    session_fill_params(s);
 
-    // ---- Build / load models ----
-    ModelWeights draft_model, target_model;
-    bool draft_is_alias = false;
-
-    if (use_real) {
-        if (args.self_spec) {
-            printf("Loading target model (self-spec): %s\n", args.target_path);
-            if (!model_load_weights(target_model, args.target_path, nullptr)) {
-                fprintf(stderr, "Failed to load target model\n"); return 1;
-            }
-            draft_model = target_model;
-            draft_is_alias = true;
-        } else {
-            printf("Loading draft model: %s\n", args.draft_path);
-            if (!model_load_weights(draft_model, args.draft_path, nullptr)) {
-                fprintf(stderr, "Failed to load draft model\n"); return 1;
-            }
-            printf("Loading target model: %s\n", args.target_path);
-            if (!model_load_weights(target_model, args.target_path, nullptr)) {
-                fprintf(stderr, "Failed to load target model\n"); return 1;
-            }
-        }
-        printf("\n");
-    } else if (args.self_spec) {
-        ModelConfig target_cfg = make_target_config();
-        model_alloc(target_model, target_cfg);
-        model_init_random(target_model, args.seed);
-        draft_model = target_model;
-        draft_is_alias = true;
-        printf("Dummy self-spec model: d=%d/%dh, %d layers total\n",
-               target_cfg.d_model, target_cfg.n_heads, target_cfg.n_layers);
+    // Fresh KV for this request (vLLM-style: new sequence, same resident weights).
+    if (s.kv_shared) {
+        kv_cache_reset(s.target_kv);
     } else {
-        ModelConfig draft_cfg  = make_draft_config();
-        ModelConfig target_cfg = make_target_config();
-        model_alloc(draft_model,  draft_cfg);
-        model_alloc(target_model, target_cfg);
-        model_init_random(draft_model,  args.seed);
-        model_init_random(target_model, args.seed + 1000);
-        printf("Dummy models: draft d=%d/%dh, target d=%d/%dh, vocab=%d\n",
-               draft_cfg.d_model, draft_cfg.n_heads,
-               target_cfg.d_model, target_cfg.n_heads,
-               target_cfg.vocab_size);
+        kv_cache_reset(s.draft_kv);
+        kv_cache_reset(s.target_kv);
     }
+    if (s.do_baseline)
+        kv_cache_reset(s.baseline_kv);
 
-    // Self-spec: draft runs only the first n_draft_layers (same weights as target).
-    if (args.self_spec) {
-        int n_dl = args.draft_layers > 0
-                 ? args.draft_layers
-                 : target_model.cfg.n_layers / 2;
-        if (n_dl < 1) n_dl = 1;
-        if (n_dl >= target_model.cfg.n_layers)
-            n_dl = target_model.cfg.n_layers - 1;
-        draft_model.cfg.n_layers = n_dl;
-        printf("Self-spec draft layers: 1..%d | target layers: 1..%d\n\n",
-               n_dl, target_model.cfg.n_layers);
-    }
-
-    // ---- Build prompt ----
-    int* h_prompt  = nullptr;
-    int  prompt_len = 0;
-
-    if (use_real && args.prompt_tok[0] != '\0') {
-        h_prompt = tok_load_alloc(args.prompt_tok, &prompt_len);
-        if (!h_prompt) {
-            fprintf(stderr, "Failed to load prompt from %s\n", args.prompt_tok);
-            return 1;
-        }
-        printf("Prompt: %d tokens loaded from %s\n\n", prompt_len, args.prompt_tok);
-    } else {
-        // Dummy prompt: tokens 1, 2, 3, ...
-        prompt_len = args.prompt_len;
-        h_prompt   = new int[prompt_len];
-        for (int i = 0; i < prompt_len; i++)
-            h_prompt[i] = (i + 1) % DEFAULT_VOCAB_SIZE;
-        printf("Dummy prompt: %d tokens\n\n", prompt_len);
-    }
-
-    // Copy prompt to device (needed by megakernel path)
-    int* d_prompt;
-    CUDA_CHECK(cudaMalloc(&d_prompt, prompt_len * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int),
+    CUDA_CHECK(cudaMemcpy(s.d_prompt, h_prompt, prompt_len * sizeof(int),
                           cudaMemcpyHostToDevice));
 
-    // ---- Allocate KV caches ----
-    ModelConfig& dc = draft_model.cfg;
-    ModelConfig& tc = target_model.cfg;
+    float baseline_ms = 0.f;
+    GenerationResult h_baseline{};
 
-    KVCache draft_kv, target_kv, baseline_kv;
-    const bool kv_shared = args.self_spec;
-
-    if (kv_shared) {
-        // Self-spec: one cache (full target depth); draft partial forwards share it.
-        kv_cache_alloc(target_kv, tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
-        draft_kv = target_kv;
-        printf("KV cache: shared (target depth %d layers)\n", tc.n_layers);
-    } else {
-        kv_cache_alloc(draft_kv,    dc.n_layers, dc.d_head, MAX_KV_BLOCKS);
-        kv_cache_alloc(target_kv,   tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
+    if (s.do_baseline) {
+        printf("\n=== Baseline (target-only) ===\n");
+        CUDA_CHECK(cudaEventRecord(s.ev_start));
+        if (s.args.use_mega) {
+            megakernel_baseline(s.target_model, s.baseline_kv,
+                                s.d_prompt, prompt_len, s.d_baseline_result,
+                                s.params);
+        } else {
+            multikernel_baseline(s.target_model, s.baseline_kv,
+                                 h_prompt, prompt_len, s.d_baseline_result,
+                                 s.params, &s.eng);
+        }
+        CUDA_CHECK(cudaEventRecord(s.ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(s.ev_stop));
+        CUDA_CHECK(cudaEventElapsedTime(&baseline_ms, s.ev_start, s.ev_stop));
+        CUDA_CHECK(cudaMemcpy(&h_baseline, s.d_baseline_result,
+                              sizeof(GenerationResult), cudaMemcpyDeviceToHost));
+        print_tokens("Baseline out", h_baseline.output_tokens, h_baseline.n_generated);
+        printf("Time: %.2f ms | Tokens: %d | Tok/s: %.1f\n",
+               baseline_ms, h_baseline.n_generated,
+               h_baseline.n_generated / (baseline_ms / 1000.0f));
     }
-    kv_cache_alloc(baseline_kv, tc.n_layers, tc.d_head, MAX_KV_BLOCKS);
 
-    // ---- Initialise InferenceEngine (cooperative launch + stream pool) ----
-    // Sized for the target (larger) model — draft d_model ≤ target d_model.
-    InferenceEngine eng;
-    inference_engine_init(eng, target_model.cfg);
-    printf("InferenceEngine: SM%d.%d | coop_launch=%s | max_coop_blocks=%d\n",
-           eng.sm_major, eng.sm_minor,
-           eng.coop_supported ? "yes" : "no",
-           eng.max_coop_blocks);
-
-    // ---- Result buffers ----
-    GenerationResult* d_baseline_result;
-    GenerationResult* d_spec_result;
-    CUDA_CHECK(cudaMalloc(&d_baseline_result, sizeof(GenerationResult)));
-    CUDA_CHECK(cudaMalloc(&d_spec_result,     sizeof(GenerationResult)));
-
-    GenerationParams params;
-    params.max_new_tokens = args.max_new;
-    params.spec_k         = args.spec_k;
-    params.use_megakernel = args.use_mega;
-    params.stochastic_spec_decode  = args.stochastic_spec;
-    params.draft_temperature       = args.draft_temp;
-    params.adaptive_draft_temperature = args.adaptive_draft_temp;
-    params.stochastic_rng_seed     = args.spec_rng_seed;
-    params.stochastic_adapt_target_accept = args.adapt_accept_target;
-    params.stochastic_adapt_temp_gain     = args.adapt_gain;
-    params.stochastic_adapt_ewma_mix       = args.adapt_ewma_mix;
-    params.eos_token                       = args.eos_token;
-    params.self_speculative                = args.self_spec;
-    params.n_draft_layers                  = draft_model.cfg.n_layers;
-
-    if (args.eos_token >= 0)
-        printf("EOS token: %d\n", args.eos_token);
-
-    // ---- Warmup ----
-    printf("Warming up (first-call JIT and CUDA init)...\n");
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ==========================================================
-    // Baseline: target-only autoregressive
-    // ==========================================================
-    printf("\n=== Baseline (target-only) ===\n");
-
-    cudaEvent_t ev_start, ev_stop;
-    CUDA_CHECK(cudaEventCreate(&ev_start));
-    CUDA_CHECK(cudaEventCreate(&ev_stop));
-
-    CUDA_CHECK(cudaEventRecord(ev_start));
-    if (args.use_mega) {
-        megakernel_baseline(target_model, baseline_kv,
-                            d_prompt, prompt_len, d_baseline_result, params);
-    } else {
-        multikernel_baseline(target_model, baseline_kv,
-                             h_prompt, prompt_len, d_baseline_result, params, &eng);
-    }
-    CUDA_CHECK(cudaEventRecord(ev_stop));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop));
-
-    float baseline_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&baseline_ms, ev_start, ev_stop));
-
-    GenerationResult h_baseline;
-    CUDA_CHECK(cudaMemcpy(&h_baseline, d_baseline_result,
-                          sizeof(GenerationResult), cudaMemcpyDeviceToHost));
-
-    print_tokens("Baseline out", h_baseline.output_tokens, h_baseline.n_generated);
-    printf("Time: %.2f ms | Tokens: %d | Tok/s: %.1f\n",
-           baseline_ms, h_baseline.n_generated,
-           h_baseline.n_generated / (baseline_ms / 1000.0f));
-
-    // ==========================================================
-    // Speculative decoding
-    // ==========================================================
     printf("\n=== Speculative (%s, k=%d) ===\n",
-           args.self_spec ? "self-spec" : "draft+target", args.spec_k);
+           s.args.self_spec ? "self-spec" : "draft+target", s.args.spec_k);
 
-    CUDA_CHECK(cudaEventRecord(ev_start));
-    if (args.use_mega) {
-        megakernel_speculative(draft_model, target_model,
-                               draft_kv, target_kv,
-                               d_prompt, prompt_len, d_spec_result, params);
+    CUDA_CHECK(cudaEventRecord(s.ev_start));
+    if (s.args.use_mega) {
+        megakernel_speculative(s.draft_model, s.target_model,
+                               s.draft_kv, s.target_kv,
+                               s.d_prompt, prompt_len, s.d_spec_result, s.params);
     } else {
-        multikernel_speculative(draft_model, target_model,
-                                draft_kv, target_kv,
-                                h_prompt, prompt_len, d_spec_result, params, &eng);
+        multikernel_speculative(s.draft_model, s.target_model,
+                                s.draft_kv, s.target_kv,
+                                h_prompt, prompt_len, s.d_spec_result,
+                                s.params, &s.eng);
     }
-    CUDA_CHECK(cudaEventRecord(ev_stop));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    CUDA_CHECK(cudaEventRecord(s.ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(s.ev_stop));
 
-    float spec_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&spec_ms, ev_start, ev_stop));
+    float spec_ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&spec_ms, s.ev_start, s.ev_stop));
 
-    GenerationResult h_spec;
-    CUDA_CHECK(cudaMemcpy(&h_spec, d_spec_result,
+    GenerationResult h_spec{};
+    CUDA_CHECK(cudaMemcpy(&h_spec, s.d_spec_result,
                           sizeof(GenerationResult), cudaMemcpyDeviceToHost));
 
     print_tokens("Speculative  ", h_spec.output_tokens, h_spec.n_generated);
@@ -369,78 +308,332 @@ int main(int argc, char** argv) {
                : 0.0f);
     printf("Speculation iterations: %d\n", h_spec.spec_iterations);
 
-    // ==========================================================
-    // Correctness verification
-    // ==========================================================
-    printf("\n=== Verification ===\n");
-    if (params.stochastic_spec_decode) {
-        printf("Byte-for-byte baseline match skipped "
-               "(stochastic speculative sampling is non-deterministic).\n");
-    } else {
-        int min_len = h_baseline.n_generated < h_spec.n_generated
-                    ? h_baseline.n_generated : h_spec.n_generated;
-        bool match  = (h_baseline.n_generated == h_spec.n_generated);
-        for (int i = 0; i < min_len && match; i++) {
-            if (h_baseline.output_tokens[i] != h_spec.output_tokens[i])
-                match = false;
-        }
-        printf("Output match: %s\n", match ? "PASS ✓" : "FAIL ✗");
-        if (!match) {
-            printf("  Lengths: baseline=%d spec=%d\n",
-                   h_baseline.n_generated, h_spec.n_generated);
-            for (int i = 0; i < min_len; i++) {
-                if (h_baseline.output_tokens[i] != h_spec.output_tokens[i]) {
-                    printf("  First mismatch @ [%d]: baseline=%d spec=%d\n",
-                           i, h_baseline.output_tokens[i],
-                           h_spec.output_tokens[i]);
-                    break;
+    if (s.do_baseline) {
+        printf("\n=== Verification ===\n");
+        if (s.params.stochastic_spec_decode) {
+            printf("Byte-for-byte baseline match skipped "
+                   "(stochastic speculative sampling is non-deterministic).\n");
+        } else {
+            int min_len = h_baseline.n_generated < h_spec.n_generated
+                        ? h_baseline.n_generated : h_spec.n_generated;
+            bool match  = (h_baseline.n_generated == h_spec.n_generated);
+            for (int i = 0; i < min_len && match; i++) {
+                if (h_baseline.output_tokens[i] != h_spec.output_tokens[i])
+                    match = false;
+            }
+            printf("Output match: %s\n", match ? "PASS" : "FAIL");
+            if (!match) {
+                printf("  Lengths: baseline=%d spec=%d\n",
+                       h_baseline.n_generated, h_spec.n_generated);
+                for (int i = 0; i < min_len; i++) {
+                    if (h_baseline.output_tokens[i] != h_spec.output_tokens[i]) {
+                        printf("  First mismatch @ [%d]: baseline=%d spec=%d\n",
+                               i, h_baseline.output_tokens[i],
+                               h_spec.output_tokens[i]);
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    // ==========================================================
-    // Summary  (machine-parseable lines for web/backend/runner.py)
-    // ==========================================================
-    printf("\n=== Summary ===\n");
-    printf("Baseline:    %.2f ms  (%.1f tok/s)\n",
-           baseline_ms, h_baseline.n_generated / (baseline_ms / 1000.0f));
-    printf("Speculative: %.2f ms  (%.1f tok/s)\n",
-           spec_ms, h_spec.n_generated / (spec_ms / 1000.0f));
-    printf("Speedup:     %.3fx\n", baseline_ms / spec_ms);
-    printf("Accept rate: %.3f\n",
-           h_spec.draft_proposed > 0
-               ? (float)h_spec.draft_accepted / h_spec.draft_proposed
-               : 0.0f);
-
-    // ==========================================================
-    // Optional: write generated token ids to file (for Python decoding)
-    // ==========================================================
-    if (use_real && args.output_tok[0] != '\0') {
-        if (tok_save(args.output_tok, h_spec.output_tokens, h_spec.n_generated))
-            printf("\nGenerated tokens saved to: %s\n", args.output_tok);
-        printf("Decode with: python tools/hf_tok.py decode <model> %s\n",
-               args.output_tok);
-    }
-
-    // ---- Cleanup ----
-    inference_engine_destroy(eng);
-    CUDA_CHECK(cudaEventDestroy(ev_start));
-    CUDA_CHECK(cudaEventDestroy(ev_stop));
-    cudaFree(d_prompt);
-    cudaFree(d_baseline_result);
-    cudaFree(d_spec_result);
-    kv_cache_free(baseline_kv);
-    if (kv_shared) {
-        kv_cache_free(target_kv);
+        printf("\n=== Summary ===\n");
+        printf("Baseline:    %.2f ms  (%.1f tok/s)\n",
+               baseline_ms, h_baseline.n_generated / (baseline_ms / 1000.0f));
+        printf("Speculative: %.2f ms  (%.1f tok/s)\n",
+               spec_ms, h_spec.n_generated / (spec_ms / 1000.0f));
+        printf("Speedup:     %.3fx\n",
+               spec_ms > 0.f ? baseline_ms / spec_ms : 0.f);
+        printf("Accept rate: %.3f\n",
+               h_spec.draft_proposed > 0
+                   ? (float)h_spec.draft_accepted / h_spec.draft_proposed
+                   : 0.0f);
     } else {
-        kv_cache_free(draft_kv);
-        kv_cache_free(target_kv);
+        printf("\n=== Summary ===\n");
+        printf("Speculative: %.2f ms  (%.1f tok/s)\n",
+               spec_ms, h_spec.n_generated / (spec_ms / 1000.0f));
+        printf("Accept rate: %.3f\n",
+               h_spec.draft_proposed > 0
+                   ? (float)h_spec.draft_accepted / h_spec.draft_proposed
+                   : 0.0f);
     }
-    if (!draft_is_alias)
-        model_free(draft_model);
-    model_free(target_model);
-    delete[] h_prompt;
+
+    if (output_tok_path && output_tok_path[0] != '\0') {
+        if (tok_save(output_tok_path, h_spec.output_tokens, h_spec.n_generated))
+            printf("\nGenerated tokens saved to: %s\n", output_tok_path);
+        printf("Decode with: python tools/hf_tok.py decode <model> %s\n",
+               output_tok_path);
+    }
+
+    fflush(stdout);
+    return true;
+}
+
+static void print_repl_help() {
+    printf(
+        "Commands:\n"
+        "  <path.tok>         generate from a tokenised prompt file\n"
+        "  max-tokens N       set generation length\n"
+        "  k N                set speculation depth\n"
+        "  output <path>|off  set/clear default output .tok path\n"
+        "  bench on|off       enable/disable baseline comparison\n"
+        "  help               this help\n"
+        "  quit | exit        exit (unload weights)\n"
+        "\n"
+        "Tip: encode prompts with:\n"
+        "  python tools/hf_tok.py encode <hf_model> \"your text\" prompt.tok\n");
+}
+
+static void run_repl(Session& s) {
+    printf("\n=== REPL (weights resident) ===\n");
+    printf("Models stay loaded. Type a .tok path to generate, or 'help'.\n");
+    print_repl_help();
+    printf("sdec> ");
+    fflush(stdout);
+
+    char line[1024];
+    while (fgets(line, sizeof(line), stdin)) {
+        trim_inplace(line);
+        if (line[0] == '\0') {
+            printf("sdec> ");
+            fflush(stdout);
+            continue;
+        }
+
+        if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0 ||
+            strcmp(line, "q") == 0) {
+            break;
+        }
+        if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
+            print_repl_help();
+            printf("sdec> ");
+            fflush(stdout);
+            continue;
+        }
+
+        int mt = 0, kk = 0;
+        char out_buf[512] = "";
+        char bench_buf[32] = "";
+        if (sscanf(line, "max-tokens %d", &mt) == 1) {
+            if (mt < 1 || mt > MAX_SEQ_LEN - 1) {
+                fprintf(stderr, "max-tokens must be in [1, %d]\n", MAX_SEQ_LEN - 1);
+            } else {
+                s.args.max_new = mt;
+                printf("max-tokens = %d\n", mt);
+            }
+        } else if (sscanf(line, "k %d", &kk) == 1) {
+            if (kk < 1 || kk > 16) {
+                fprintf(stderr, "k must be in [1, 16]\n");
+            } else {
+                s.args.spec_k = kk;
+                printf("k = %d\n", kk);
+            }
+        } else if (sscanf(line, "output %511s", out_buf) == 1) {
+            if (strcmp(out_buf, "off") == 0 || strcmp(out_buf, "clear") == 0) {
+                s.args.output_tok[0] = '\0';
+                printf("output-tok cleared\n");
+            } else {
+                strncpy(s.args.output_tok, out_buf, 511);
+                s.args.output_tok[511] = '\0';
+                printf("output-tok = %s\n", s.args.output_tok);
+            }
+        } else if (sscanf(line, "bench %31s", bench_buf) == 1) {
+            if (strcmp(bench_buf, "on") == 0) {
+                s.do_baseline = true;
+                printf("bench = on (baseline + speculative)\n");
+            } else if (strcmp(bench_buf, "off") == 0) {
+                s.do_baseline = false;
+                printf("bench = off (spec-only)\n");
+            } else {
+                fprintf(stderr, "usage: bench on|off\n");
+            }
+        } else {
+            // Treat as prompt .tok path
+            int prompt_len = 0;
+            int* h_prompt = tok_load_alloc(line, &prompt_len);
+            if (!h_prompt) {
+                fprintf(stderr, "Failed to load prompt '%s'\n", line);
+            } else {
+                printf("Prompt: %d tokens from %s\n", prompt_len, line);
+                session_generate(s, h_prompt, prompt_len, s.args.output_tok);
+                free(h_prompt);
+            }
+        }
+
+        printf("sdec> ");
+        fflush(stdout);
+    }
+    printf("\nLeaving REPL.\n");
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char** argv) {
+    Session s;
+    parse_args(s.args, argc, argv);
+    s.do_baseline = !s.args.spec_only;
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    printf("Device: %s (SM %d.%d, %d SMs, %.1f GB)\n",
+           prop.name, prop.major, prop.minor,
+           prop.multiProcessorCount,
+           prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+
+    s.use_real = (s.args.target_path[0] != '\0' &&
+                  (s.args.draft_path[0] != '\0' || s.args.self_spec));
+    if (s.args.self_spec && s.args.draft_path[0] == '\0' &&
+        s.args.target_path[0] != '\0') {
+        strncpy(s.args.draft_path, s.args.target_path, 511);
+    }
+
+    if (s.args.repl && !s.use_real) {
+        fprintf(stderr, "--repl requires real models (--target=...)\n");
+        return 1;
+    }
+
+    printf("Mode: %s | kernel=%s | max_tokens=%d | k=%d | stochastic_spec=%d",
+           s.use_real ? "real-model" : "dummy",
+           s.args.use_mega ? "megakernel" : "multi-kernel",
+           s.args.max_new, s.args.spec_k, s.args.stochastic_spec ? 1 : 0);
+    if (s.args.self_spec) printf(" | self-spec");
+    if (s.args.repl)      printf(" | repl");
+    if (s.do_baseline)    printf(" | bench");
+    else                  printf(" | spec-only");
+    printf("\n\n");
+
+    // ---- Load / allocate models (once) ----
+    if (s.use_real) {
+        if (s.args.self_spec) {
+            printf("Loading target model (self-spec): %s\n", s.args.target_path);
+            if (!model_load_weights(s.target_model, s.args.target_path, nullptr)) {
+                fprintf(stderr, "Failed to load target model\n");
+                return 1;
+            }
+            s.draft_model = s.target_model;
+            s.draft_is_alias = true;
+        } else {
+            printf("Loading draft model: %s\n", s.args.draft_path);
+            if (!model_load_weights(s.draft_model, s.args.draft_path, nullptr)) {
+                fprintf(stderr, "Failed to load draft model\n");
+                return 1;
+            }
+            printf("Loading target model: %s\n", s.args.target_path);
+            if (!model_load_weights(s.target_model, s.args.target_path, nullptr)) {
+                fprintf(stderr, "Failed to load target model\n");
+                return 1;
+            }
+        }
+        printf("Weights resident in GPU memory.\n\n");
+    } else {
+        ModelConfig draft_cfg  = make_draft_config();
+        ModelConfig target_cfg = make_target_config();
+        model_alloc(s.draft_model, draft_cfg);
+        model_alloc(s.target_model, target_cfg);
+        printf("Dummy models allocated (no weight file).\n\n");
+    }
+
+    if (s.args.self_spec) {
+        int n_dl = s.args.draft_layers > 0
+                 ? s.args.draft_layers
+                 : s.target_model.cfg.n_layers / 2;
+        if (n_dl < 1) n_dl = 1;
+        if (n_dl >= s.target_model.cfg.n_layers)
+            n_dl = s.target_model.cfg.n_layers - 1;
+        s.draft_model.cfg.n_layers = n_dl;
+        printf("Self-spec draft layers: 1..%d | target layers: 1..%d\n\n",
+               n_dl, s.target_model.cfg.n_layers);
+    }
+
+    // ---- KV + engine (once) ----
+    ModelConfig& dc = s.draft_model.cfg;
+    ModelConfig& tc = s.target_model.cfg;
+    s.kv_shared = s.args.self_spec;
+
+    if (s.kv_shared) {
+        kv_cache_alloc(s.target_kv, tc.n_layers, kv_dim(tc), MAX_KV_BLOCKS);
+        s.draft_kv = s.target_kv;
+        printf("KV cache: shared (target depth %d layers)\n", tc.n_layers);
+    } else {
+        kv_cache_alloc(s.draft_kv,  dc.n_layers, kv_dim(dc), MAX_KV_BLOCKS);
+        kv_cache_alloc(s.target_kv, tc.n_layers, kv_dim(tc), MAX_KV_BLOCKS);
+    }
+    kv_cache_alloc(s.baseline_kv, tc.n_layers, kv_dim(tc), MAX_KV_BLOCKS);
+
+    inference_engine_init(s.eng, s.target_model.cfg);
+    s.eng.gemm_backend = s.args.gemm_backend;
+    printf("InferenceEngine: SM%d.%d | coop_launch=%s | max_coop_blocks=%d | gemm=%s\n",
+           s.eng.sm_major, s.eng.sm_minor,
+           s.eng.coop_supported ? "yes" : "no",
+           s.eng.max_coop_blocks,
+           s.eng.gemm_backend == GEMM_BACKEND_CUBLAS ? "cublas" : "legacy");
+
+    CUDA_CHECK(cudaMalloc(&s.d_baseline_result, sizeof(GenerationResult)));
+    CUDA_CHECK(cudaMalloc(&s.d_spec_result,     sizeof(GenerationResult)));
+    CUDA_CHECK(cudaMalloc(&s.d_prompt, (size_t)MAX_SEQ_LEN * sizeof(int)));
+    CUDA_CHECK(cudaEventCreate(&s.ev_start));
+    CUDA_CHECK(cudaEventCreate(&s.ev_stop));
+
+    if (s.args.eos_token >= 0)
+        printf("EOS token: %d\n", s.args.eos_token);
+
+    printf("Warming up...\n");
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // ---- One-shot prompt (optional) then REPL or exit ----
+    if (s.args.prompt_tok[0] != '\0' || !s.use_real) {
+        int* h_prompt = nullptr;
+        int  prompt_len = 0;
+
+        if (s.use_real && s.args.prompt_tok[0] != '\0') {
+            h_prompt = tok_load_alloc(s.args.prompt_tok, &prompt_len);
+            if (!h_prompt) {
+                fprintf(stderr, "Failed to load prompt from %s\n",
+                        s.args.prompt_tok);
+                return 1;
+            }
+            printf("Prompt: %d tokens loaded from %s\n",
+                   prompt_len, s.args.prompt_tok);
+        } else if (!s.use_real) {
+            prompt_len = s.args.prompt_len;
+            h_prompt   = new int[prompt_len];
+            for (int i = 0; i < prompt_len; i++)
+                h_prompt[i] = (i + 1) % DEFAULT_VOCAB_SIZE;
+            printf("Dummy prompt: %d tokens\n", prompt_len);
+        }
+
+        if (h_prompt) {
+            session_generate(s, h_prompt, prompt_len, s.args.output_tok);
+            if (s.use_real) free(h_prompt);
+            else            delete[] h_prompt;
+        }
+    } else if (!s.args.repl) {
+        fprintf(stderr,
+                "No --prompt-tok= given. Use --prompt-tok=... or --repl.\n");
+        return 1;
+    }
+
+    if (s.args.repl)
+        run_repl(s);
+
+    // ---- Cleanup (once) ----
+    inference_engine_destroy(s.eng);
+    CUDA_CHECK(cudaEventDestroy(s.ev_start));
+    CUDA_CHECK(cudaEventDestroy(s.ev_stop));
+    cudaFree(s.d_prompt);
+    cudaFree(s.d_baseline_result);
+    cudaFree(s.d_spec_result);
+    kv_cache_free(s.baseline_kv);
+    if (s.kv_shared) {
+        kv_cache_free(s.target_kv);
+    } else {
+        kv_cache_free(s.draft_kv);
+        kv_cache_free(s.target_kv);
+    }
+    if (!s.draft_is_alias)
+        model_free(s.draft_model);
+    model_free(s.target_model);
 
     printf("\nDone.\n");
     return 0;

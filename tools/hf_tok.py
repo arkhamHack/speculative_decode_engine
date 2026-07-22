@@ -64,7 +64,7 @@ def cmd_encode(args) -> None:
     ids = tok.encode(args.text, add_special_tokens=True)
     write_tok(args.output, ids)
 
-    print(f"Encoded {len(ids)} tokens → {args.output}")
+    print(f"Encoded {len(ids)} tokens -> {args.output}")
     print(f"Tokens: {ids}")
     if len(ids) <= 32:
         decoded = [tok.decode([i]) for i in ids]

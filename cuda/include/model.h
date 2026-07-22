@@ -8,15 +8,16 @@
 // ============================================================================
 // Weight layout  (all tensors in half precision, 16-byte aligned on device)
 //
-// Attention projections are all [d_model, d_model] regardless of n_heads.
-// The multi-head split is done at compute time using d_head_per = d_model/n_heads.
+// Attention projections use native GQA dimensions:
+//   Wq has n_heads columns, Wk/Wv have n_kv_heads columns (kv_dim ≤ d_model).
+//   SDEC v1/v2 files store expanded Wk/Wv [d_model, d_model]; v3 stores native.
 //
 // Per layer:
 //   rms_attn_weight  [d_model]
-//   Wq               [d_model, d_model]   row-major; col = head_concat output
-//   Wk               [d_model, d_model]
-//   Wv               [d_model, d_model]
-//   Wo               [d_model, d_model]   maps concat'd head outputs back to d_model
+//   Wq               [d_model, d_model]    row-major
+//   Wk               [d_model, kv_dim]     kv_dim = n_kv_heads * head_dim
+//   Wv               [d_model, kv_dim]
+//   Wo               [d_model, d_model]
 //   rms_mlp_weight   [d_model]
 //   W_gate           [d_model, d_ff]
 //   W_up             [d_model, d_ff]
@@ -31,13 +32,17 @@
 struct LayerWeights {
     half* rms_attn_weight;   // [d_model]
     half* Wq;                // [d_model, d_model]
-    half* Wk;                // [d_model, d_model]
-    half* Wv;                // [d_model, d_model]
+    half* Wk;                // [d_model, kv_dim]
+    half* Wv;                // [d_model, kv_dim]
     half* Wo;                // [d_model, d_model]
     half* rms_mlp_weight;    // [d_model]
     half* W_gate;            // [d_model, d_ff]
     half* W_up;              // [d_model, d_ff]
     half* W_down;            // [d_ff,    d_model]
+    // Optional Q/K/V biases (SDEC v5+ / Qwen2). nullptr when absent.
+    half* Wq_bias;           // [d_model]  or nullptr
+    half* Wk_bias;           // [kv_dim]   or nullptr
+    half* Wv_bias;           // [kv_dim]   or nullptr
 };
 
 struct ModelWeights {
@@ -48,31 +53,15 @@ struct ModelWeights {
     LayerWeights  layers[MAX_LAYERS];
 };
 
-// ============================================================================
-// Host API
-// ============================================================================
-
-// Allocate device memory for all weight tensors according to cfg.
 void model_alloc(ModelWeights& model, const ModelConfig& cfg);
-
-// Free all device weight allocations.
 void model_free(ModelWeights& model);
 
-// Fill weights with small Gaussian random values (for dummy/benchmark mode).
-void model_init_random(ModelWeights& model, unsigned seed);
 
 // Load weights from an SDEC binary file produced by tools/export_model.py.
 // Fills cfg_out with the model configuration read from the file header.
 // Returns true on success; on failure prints an error and returns false.
 bool model_load_weights(ModelWeights& model, const char* path,
                         ModelConfig* cfg_out = nullptr);
-
-// ============================================================================
-// Device functions  (called from within a single-block CUDA kernel)
-//
-// All device functions operate on the calling block's shared scratch after hidden[]
-// (streaming attention + tiled MLP keep large temporaries factorized/tiled — no seq×d_ff arrays).
-// ============================================================================
 
 // Embedding lookup: hidden[d] = token_embedding[token_id, :]
 __device__ void model_embed(const ModelWeights& model, int token_id,
@@ -195,6 +184,8 @@ struct InferenceEngine {
     bool coop_supported;   // device supports cudaLaunchCooperativeKernel
     int  max_coop_blocks;  // conservative cap for cooperative_decode_kernel
 
+    GemmBackendType gemm_backend = GEMM_BACKEND_LEGACY;
+
     // Cooperative single-token decode residual stream + scratch
     float* d_coop_hidden;   // [d_model]
     float* d_coop_scratch;  // [7*d_model + 2*MLP_FF_TILE]
@@ -206,32 +197,12 @@ struct InferenceEngine {
     // Self-spec: post-prefix activations [(spec_k + 1) * d_model] (bonus slot at index k)
     float* d_selfspec_hiddens;
 
-    // -----------------------------------------------------------------------
-    // Intra-layer stream-overlap scratch for Q/K/V and gate/up projections.
-    //
-    // d_ovl_buf[0] = target model (stream[1])
-    // d_ovl_buf[1] = draft model  (stream[0])
-    //
-    // Buffer layout per set — [7*d + 2*dff] floats (d = ovl_buf_d, dff = ovl_buf_dff):
-    //   [0..d)            hidden state (residual stream)
-    //   [d..2d)           RMSNorm output scratch
-    //   [2d..3d)          Q projection
-    //   [3d..4d)          K projection
-    //   [4d..5d)          V projection
-    //   [5d..6d)          attention output (pre-Wo)
-    //   [6d..7d)          MLP accumulator
-    //   [7d..7d+dff)      gate projection output (full, not tiled)
-    //   [7d+dff..7d+2dff) up  projection output (full, not tiled)
-    // -----------------------------------------------------------------------
-    float* d_ovl_buf[2];
-    int    ovl_buf_d;    // d_model for which d_ovl_buf was sized
-    int    ovl_buf_dff;  // d_ff   for which d_ovl_buf was sized
-
-    // CUDA events for intra-layer projection synchronisation:
-    //   ovl_events[0] — RMSNorm done / Q projection done
-    //   ovl_events[1] — K projection done / gate projection done
-    //   ovl_events[2] — V projection done / up  projection done
-    cudaEvent_t ovl_events[3];
+    // cuBLAS forward scratch (shared by prefill, decode, verify).
+    // Lazy-growth: allocated on first cublas_forward call, grown if needed.
+    float* d_cublas_buf;       // float scratch for activations
+    half*  d_cublas_x16;       // FP16 conversion buffer
+    size_t cublas_buf_floats;  // floats allocated in d_cublas_buf
+    size_t cublas_x16_halves;  // halfs allocated in d_cublas_x16
 };
 
 // Allocate and initialise the engine for the given (largest) model config.

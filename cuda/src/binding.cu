@@ -20,7 +20,6 @@ namespace py = pybind11;
 static py::dict run_benchmark(const std::string& mode,
                               int max_tokens,
                               int spec_k,
-                              unsigned seed,
                               int prompt_len) {
     bool use_mega = (mode == "mega");
 
@@ -40,14 +39,12 @@ static py::dict run_benchmark(const std::string& mode,
     ModelWeights draft_model, target_model;
     model_alloc(draft_model, draft_cfg);
     model_alloc(target_model, target_cfg);
-    model_init_random(draft_model, seed);
-    model_init_random(target_model, seed + 1000);
 
     // KV caches
     KVCache draft_kv, target_kv, baseline_kv;
-    kv_cache_alloc(draft_kv, draft_cfg.n_layers, draft_cfg.d_head, MAX_KV_BLOCKS);
-    kv_cache_alloc(target_kv, target_cfg.n_layers, target_cfg.d_head, MAX_KV_BLOCKS);
-    kv_cache_alloc(baseline_kv, target_cfg.n_layers, target_cfg.d_head, MAX_KV_BLOCKS);
+    kv_cache_alloc(draft_kv, draft_cfg.n_layers, kv_dim(draft_cfg), MAX_KV_BLOCKS);
+    kv_cache_alloc(target_kv, target_cfg.n_layers, kv_dim(target_cfg), MAX_KV_BLOCKS);
+    kv_cache_alloc(baseline_kv, target_cfg.n_layers, kv_dim(target_cfg), MAX_KV_BLOCKS);
 
     // Prompt
     std::vector<int> h_prompt(prompt_len);
@@ -167,7 +164,6 @@ PYBIND11_MODULE(spec_decode_cuda, m) {
           py::arg("mode") = "multi",
           py::arg("max_tokens") = 32,
           py::arg("spec_k") = DEFAULT_SPEC_K,
-          py::arg("seed") = 42,
           py::arg("prompt_len") = 4,
           "Run baseline + speculative decoding benchmark. "
           "Returns a dict with timing and token results.");

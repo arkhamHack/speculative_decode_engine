@@ -41,8 +41,8 @@ struct KVCache {
     // 2 * KV_BLOCK_SIZE * d_head halfs.
     half*  pool;           // flat device buffer
     int    pool_size;      // total physical blocks
-    int    d_head;         // total KV dimension stored per token (= d_model)
-                           // per-head dim = d_head / n_heads (computed at runtime)
+    int    d_head;         // total KV dimension stored per token
+                           // = kv_dim = n_kv_heads * head_dim  (≤ d_model for GQA)
     int    n_layers;
 
     // Global sequence length for this cache. All layers share the same seq_len.

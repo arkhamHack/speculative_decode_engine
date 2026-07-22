@@ -184,6 +184,27 @@ void device_matvec(const float* x, const half* W,
     __syncthreads();
 }
 
+// out[i] += bias[i]  (no-op when bias == nullptr)
+__device__ __forceinline__
+void device_add_bias(float* out, const half* bias, int n) {
+    if (!bias) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[i] += __half2float(bias[i]);
+    __syncthreads();
+}
+
+// g_out[b, :] += bias[:] for b in [0, B)
+__device__ __forceinline__
+void device_add_bias_batched(float* g_out, const half* bias, int d_out, int B) {
+    if (!bias) return;
+    for (int b = 0; b < B; b++) {
+        float* row = g_out + (size_t)b * d_out;
+        for (int i = threadIdx.x; i < d_out; i += blockDim.x)
+            row[i] += __half2float(bias[i]);
+    }
+    __syncthreads();
+}
+
 // Column slice: out[jc] = x @ W[:, col0+jc], jc in [0, ncol).
 // ncol may be smaller than blockDim.x; out must hold ncol floats contiguously.
 __device__ __forceinline__
@@ -404,24 +425,6 @@ __device__ __forceinline__ void device_matvec_partial(
         int c = col_start + oc;
         for (int r = 0; r < d_in; r++)
             acc += x[r] * __half2float(__ldg(&W[r * d_out + c]));
-        out[c] = acc;
-    }
-}
-
-// INT8 variant (W8A16): W_q is int8, scale is per-row FP16 applied before accumulation.
-__device__ __forceinline__ void device_matvec_int8_partial(
-        const float*   __restrict__ x,
-        const int8_t*  __restrict__ W_q,
-        const half*    __restrict__ scale,
-        float*                      out,
-        int d_in, int d_out,
-        int col_start, int col_count) {
-    int tid = threadIdx.x;
-    for (int oc = tid; oc < col_count; oc += blockDim.x) {
-        float acc = 0.f;
-        int c = col_start + oc;
-        for (int r = 0; r < d_in; r++)
-            acc += x[r] * __half2float(scale[r]) * (float)__ldg(&W_q[r * d_out + c]);
         out[c] = acc;
     }
 }
