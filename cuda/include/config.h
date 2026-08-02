@@ -2,9 +2,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
-// ============================================================================
 // Compile-time constants (hard upper bounds for static array sizing)
-// ============================================================================
 
 // Maximum sequence length (KV logical length bound; chunked attention avoids O(seq) scratch)
 constexpr int MAX_SEQ_LEN      = 1024;
@@ -39,9 +37,7 @@ constexpr int DEFAULT_VOCAB_SIZE = 256;
 // Binary weight file magic ("SDEC" in little-endian uint32)
 constexpr uint32_t SDEC_MAGIC   = 0x43454453u;
 
-// ============================================================================
 // RoPE scaling modes  (stored in SDEC v3+ header; runtime enum)
-// ============================================================================
 
 enum RopeScalingType : int {
     ROPE_SCALING_NONE   = 0,   // standard RoPE: angle = pos * inv_freq
@@ -50,9 +46,7 @@ enum RopeScalingType : int {
     ROPE_SCALING_YARN   = 3,   // YaRN (NTK-by-parts, temperature + attn scaling)
 };
 
-// ============================================================================
 // Attention backend selector  (per-model; stored in SDEC v4+ header)
-// ============================================================================
 
 enum AttentionType : int {
     ATTN_SOFTMAX       = 0,   // standard scaled-dot-product (MHA / GQA / MQA)
@@ -61,18 +55,14 @@ enum AttentionType : int {
     ATTN_LINEAR        = 3,   // (reserved) generic linear attention
 };
 
-// ============================================================================
 // GEMM backend selector  (host-launched cuBLAS vs device-internal matvec)
-// ============================================================================
 
 enum GemmBackendType : int {
     GEMM_BACKEND_LEGACY = 0,   // device_matvec / megakernel (current)
     GEMM_BACKEND_CUBLAS = 1,   // host-orchestrated cublasGemmEx with tensor ops
 };
 
-// ============================================================================
 // Model configuration  (runtime, stored in each ModelWeights)
-// ============================================================================
 
 struct ModelConfig {
     int n_layers   = 2;
@@ -108,7 +98,6 @@ inline ModelConfig make_target_config() {
     c.d_ff=1024; c.vocab_size=DEFAULT_VOCAB_SIZE; return c;
 }
 
-// ============================================================================
 // Dynamic shared-memory budget
 //
 // kv_phase  layout: normed[d] | q[d] | kv_temp[kd] | k_save[kd] | scratch
@@ -116,31 +105,36 @@ inline ModelConfig make_target_config() {
 // model_output:      buf[d] | scratch[max(d + WARP_SIZE, 2*BLOCK_THREADS)]
 //
 // We take the max of all phases.
-// ============================================================================
 
 inline size_t compute_smem_bytes(const ModelConfig& cfg) {
     int d  = cfg.d_model;
     int kd = cfg.n_kv_heads * (d / cfg.n_heads);   // kv_dim
-
-    // kv_phase + attn_phase: 2*d + 2*kd + scratch
-    size_t phase_floats = (size_t)(2 * d + 2 * kd);
 
     // Scratch needs room for reductions (d + WARP_SIZE) and argmax (2*BLOCK_THREADS)
     size_t scratch_a = (size_t)d + WARP_SIZE;
     size_t scratch_b = (size_t)BLOCK_THREADS * 2;
     size_t scratch   = scratch_a > scratch_b ? scratch_a : scratch_b;
 
-    // model_output needs d + scratch; kv/attn phase needs phase_floats + scratch
-    size_t floats = phase_floats + scratch;
+    // Single-token kv/attn phase: normed[d] | q[d] | kv_temp[kd] | k_save[kd] | scratch
+    size_t phase_floats = (size_t)(2 * d + 2 * kd) + scratch;
+
+    // Batched verify (model_batch_forward_logits / _selfspec_verify_): the s_red
+    // scratch sits at smem + 4*d regardless of kd, so it needs 4*d + scratch.
+    // Under GQA (kd < d) this exceeds the single-token phase and MUST be counted,
+    // or the speculative megakernel overruns shared memory (illegal access on Qwen).
+    size_t batch_floats = (size_t)(4 * d) + scratch;
+
+    // model_output: buf[d] | scratch
     size_t out_floats = (size_t)d + scratch;
-    if (out_floats > floats) floats = out_floats;
+
+    size_t floats = phase_floats;
+    if (batch_floats > floats) floats = batch_floats;
+    if (out_floats  > floats) floats = out_floats;
 
     return floats * sizeof(float);
 }
 
-// ============================================================================
 // Generation parameters and result structure
-// ============================================================================
 
 struct GenerationParams {
     int    max_new_tokens;

@@ -2,7 +2,6 @@
 #include "config.h"
 #include <cuda_fp16.h>
 
-// ============================================================================
 // Paged KV Cache Design
 //
 // Memory layout (per block):
@@ -17,7 +16,6 @@
 // Rollback:
 //   Set seq_len = target_len.  No deallocation; blocks are reused on next
 //   append (data overwritten in-place).
-// ============================================================================
 
 // Points to the raw storage of one KV block (K then V, contiguous).
 // The total number of halfs = 2 * KV_BLOCK_SIZE * d_head.
@@ -52,9 +50,7 @@ struct KVCache {
     int    next_free_block;
 };
 
-// ============================================================================
 // Host API
-// ============================================================================
 
 // Allocate a KV cache for a model on the GPU.
 void kv_cache_alloc(KVCache& cache, int n_layers, int d_head,
@@ -66,9 +62,7 @@ void kv_cache_free(KVCache& cache);
 // Reset sequence length to 0 and clear block tables (host call).
 void kv_cache_reset(KVCache& cache);
 
-// ============================================================================
 // Device functions -- called from within kernels
-// ============================================================================
 
 // Append one token's K and V vectors to the cache for a specific layer.
 // k_vec and v_vec are float arrays of length d_head (in registers/smem).

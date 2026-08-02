@@ -3,10 +3,8 @@
 #include "model.h"
 #include "kv_cache.h"
 
-// ============================================================================
 // Multi-kernel path: host drives the generation loop, one kernel launch per
 // forward pass step.  Higher launch overhead but simpler to debug.
-// ============================================================================
 
 // Baseline autoregressive: target model only, one token at a time.
 // eng: optional InferenceEngine for cooperative-launch and stream-overlap paths.
@@ -28,16 +26,23 @@ void multikernel_speculative(const ModelWeights& draft_model,
                              const GenerationParams& params,
                              InferenceEngine* eng = nullptr);
 
-// ============================================================================
 // Persistent megakernel path: typically a single launch (no CPU sync mid-decode).
 // Greedy speculative and stochastic speculative (--stochastic-spec) both route here.
-// ============================================================================
 
 void megakernel_baseline(const ModelWeights& target_model,
                          KVCache& target_kv,
                          const int* prompt, int prompt_len,
                          GenerationResult* d_result,
                          const GenerationParams& params);
+
+// Persistent cooperative baseline: whole decode loop in one multi-SM launch.
+// Splits the output-projection GEMV across all SMs; falls back to the
+// single-block megakernel when cooperative launch is unsupported.
+void megakernel_baseline_coop(const ModelWeights& target_model,
+                              KVCache& target_kv,
+                              const int* prompt, int prompt_len,
+                              GenerationResult* d_result,
+                              const GenerationParams& params);
 
 void megakernel_speculative(const ModelWeights& draft_model,
                             const ModelWeights& target_model,

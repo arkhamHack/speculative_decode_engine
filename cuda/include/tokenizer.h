@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <vector>
 
-// ============================================================================
 // Tokenizer
 //
 // The C++/CUDA runtime uses a minimal binary-file-based tokenizer:
@@ -15,7 +14,6 @@
 //   [token_ids: n_tokens * uint32]
 //
 // This host-side struct just wraps the two I/O operations.
-// ============================================================================
 
 struct Tokenizer {
     // Load token IDs from a .tok binary file produced by tools/hf_tok.py.
@@ -29,9 +27,7 @@ struct Tokenizer {
     std::vector<int> ids;
 };
 
-// ============================================================================
 // Convenience helpers
-// ============================================================================
 
 // Read token IDs from a .tok file into a plain C array.
 // *out_n receives the count.  Caller must free() the returned buffer.

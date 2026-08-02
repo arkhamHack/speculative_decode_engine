@@ -7,9 +7,7 @@
 #include <vector>
 #include <cublas_v2.h>
 
-// ============================================================================
 // Host: allocate weight tensors on the GPU (16-byte aligned)
-// ============================================================================
 
 static half* alloc_half(size_t n) {
     half* ptr = nullptr;
@@ -67,7 +65,6 @@ void model_free(ModelWeights& model) {
 }
 
 
-// ============================================================================
 // Host: load weights from an SDEC binary file
 //
 // Supported versions:
@@ -82,7 +79,6 @@ void model_free(ModelWeights& model) {
 //       Wq_bias[d], Wk_bias[kv_dim], Wv_bias[kv_dim] after Wv
 //
 // All data values are float16 (2 bytes each).
-// ============================================================================
 
 bool model_load_weights(ModelWeights& model, const char* path,
                         ModelConfig* cfg_out) {
@@ -277,12 +273,10 @@ bool model_load_weights(ModelWeights& model, const char* path,
     return true;
 }
 
-// ============================================================================
 // Device: rotary positional embeddings with optional scaling
 //
 // Supports: none (standard), linear, NTK-aware, YaRN
 // Applied separately to Q (n_heads) and K (n_kv_heads) for GQA support.
-// ============================================================================
 
 __device__ void rope_apply_inplace(float* x, int n_heads_x, int dph,
                                    int pos, float rope_theta,
@@ -315,8 +309,11 @@ __device__ void rope_apply_inplace(float* x, int n_heads_x, int dph,
             float c = cosf(angle);
             float s = sinf(angle);
 
-            int i0 = base + 2 * j;
-            int i1 = base + 2 * j + 1;
+            // rotate_half (HF/Llama/Qwen): pair dim j with dim j+dph/2,
+            // NOT the interleaved (2j, 2j+1) GPT-J layout — matches the
+            // unpermuted HF weight layout the exporter writes.
+            int i0 = base + j;
+            int i1 = base + j + pairs;
             float x0 = x[i0], x1 = x[i1];
             x[i0] = x0 * c - x1 * s;
             x[i1] = x0 * s + x1 * c;
@@ -332,27 +329,20 @@ __device__ void rope_apply_heads_qk_inplace(float* q, float* k, int nh, int dph,
     rope_apply_inplace(k, nh, dph, pos_m, rope_theta, ROPE_SCALING_NONE, 1.0f);
 }
 
-// ============================================================================
-// Device: embedding lookup
-// ============================================================================
-
 __device__ void model_embed(const ModelWeights& model, int token_id,
                             float* hidden) {
     int tid = threadIdx.x;
     int d   = model.cfg.d_model;
-    // Stride loop handles d > BLOCK_THREADS
     for (int i = tid; i < d; i += blockDim.x)
         hidden[i] = __half2float(model.token_embedding[token_id * d + i]);
     __syncthreads();
 }
 
-// ============================================================================
 // Device: Phase 1 of transformer layer — Q/K/V projections + RoPE + KV write.
 //
 // After return, smem[d .. 2*d) holds Q with RoPE at seq_pos.
 // The KV cache has K,V for layer `layer_idx` appended at position seq_pos.
 // hidden is not modified.
-// ============================================================================
 __device__ void model_layer_kv_phase(const ModelWeights& model, int layer_idx,
                                       const float* hidden, KVCache& kv,
                                       int seq_pos, float* smem) {
@@ -393,13 +383,11 @@ __device__ void model_layer_kv_phase(const ModelWeights& model, int layer_idx,
     // After return: smem[d..2d) = q_all with RoPE — preserved for attn phase.
 }
 
-// ============================================================================
 // Device: Phase 2 of transformer layer — attention over [0..seq_pos] + FFN.
 //
 // Requires smem[d .. 2*d) = Q with RoPE written by model_layer_kv_phase, and
 // the KV cache to already contain K,V at seq_pos (written by kv_phase).
 // hidden is updated with the attention + MLP residuals.
-// ============================================================================
 __device__ void model_layer_attn_mlp_phase(const ModelWeights& model,
                                             int layer_idx,
                                             float* hidden, KVCache& kv,
@@ -452,7 +440,9 @@ __device__ void model_layer_attn_mlp_phase(const ModelWeights& model,
     float* normed    = smem;        // reuse slot 0
     float* mlp_accum = smem + d;    // reuse q_all/wo_buf slot
     float* gate_buf  = smem + 2 * d;
-    float* up_buf    = smem + 2 * d + kd;   // reuse after KV phase
+    // up_buf must clear gate_buf's full tile width (MLP_FF_TILE), not kd — under
+    // GQA kd can be < MLP_FF_TILE, which would alias gate_buf into up_buf.
+    float* up_buf    = smem + 2 * d + MLP_FF_TILE;
 
     int tile_ff = MLP_FF_TILE < d ? MLP_FF_TILE : d;
 
@@ -487,12 +477,10 @@ __device__ void model_layer_attn_mlp_phase(const ModelWeights& model,
     __syncthreads();
 }
 
-// ============================================================================
 // Device: multi-head attention + SwiGLU MLP transformer layer
 //
 // Thin wrapper — calls kv_phase then attn_mlp_phase sequentially.
 // Use the two phase functions directly in cooperative multi-block kernels.
-// ============================================================================
 __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
                                     float* hidden, KVCache& kv,
                                     int current_seq_len, float* smem) {
@@ -500,10 +488,8 @@ __device__ void model_layer_forward(const ModelWeights& model, int layer_idx,
     model_layer_attn_mlp_phase(model, layer_idx, hidden, kv, current_seq_len, smem);
 }
 
-// ============================================================================
 // Device: final RMSNorm + output projection
 // g_logits is a global-memory buffer of vocab_size floats.
-// ============================================================================
 
 __device__ void model_output(const ModelWeights& model,
                              const float* hidden, float* g_logits, float* smem) {
@@ -519,9 +505,7 @@ __device__ void model_output(const ModelWeights& model,
     device_matvec(normed, model.output_proj, g_logits, d, V);
 }
 
-// ============================================================================
 // Device: full single-token forward (logits only, for sampling kernels)
-// ============================================================================
 
 __device__ void model_forward_logits(const ModelWeights& model, KVCache& kv,
                                      int token_id, int current_seq_len,
@@ -535,10 +519,8 @@ __device__ void model_forward_logits(const ModelWeights& model, KVCache& kv,
     model_output(model, hidden, g_logits, smem);
 }
 
-// ============================================================================
 // Device: full single-token forward pass
 // Returns the greedy next-token id.
-// ============================================================================
 
 __device__ int model_forward(const ModelWeights& model, KVCache& kv,
                              int token_id, int current_seq_len,
@@ -549,9 +531,7 @@ __device__ int model_forward(const ModelWeights& model, KVCache& kv,
     return global_argmax(g_logits, model.cfg.vocab_size, smem);
 }
 
-// ============================================================================
 // Self-spec partial-forward helpers
-// ============================================================================
 
 __device__ void device_copy_hidden_to_global(const float* hidden, float* g_out,
                                              int d) {
@@ -603,22 +583,6 @@ __device__ void model_forward_verify_from_hidden_logits(
     model_output(model, hidden, g_logits, smem);
 }
 
-__device__ void model_forward_verify_anchor_logits(
-    const ModelWeights& model, KVCache& kv,
-    int token_id, int layer_start, int current_seq_len,
-    float* hidden, float* g_logits, float* smem) {
-    model_embed(model, token_id, hidden);
-
-    for (int l = 0; l < layer_start; l++)
-        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
-
-    for (int l = layer_start; l < model.cfg.n_layers; l++)
-        model_layer_forward(model, l, hidden, kv, current_seq_len, smem);
-
-    model_output(model, hidden, g_logits, smem);
-}
-
-// ============================================================================
 // Device: batched forward — process B tokens, reading each weight matrix once.
 //
 // g_work layout (all B-major, floats):
@@ -629,7 +593,6 @@ __device__ void model_forward_verify_anchor_logits(
 //   [4*B*d      .. 5*B*d)       g_tmp (attn_out staging / gate activation)
 //   [5*B*d      .. 6*B*d)       g_mlp_acc
 //   [6*B*d      .. 6*B*d+B*T)   g_mlp_up  (T = MLP_FF_TILE)
-// ============================================================================
 
 __device__ void model_batch_forward_logits(
     const ModelWeights& model, KVCache& kv,
@@ -988,9 +951,7 @@ __device__ void model_batch_forward_selfspec_verify_logits(
     device_matvec_batched(g_normed, model.output_proj, g_logits_out, d, V, B);
 }
 
-// ============================================================================
 // InferenceEngine: init / destroy
-// ============================================================================
 
 void inference_engine_init(InferenceEngine& eng, const ModelConfig& cfg) {
     // Query device capabilities

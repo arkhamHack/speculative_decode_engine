@@ -1,4 +1,3 @@
-// ============================================================================
 // bench_gemm.cu  --  GEMM/GEMV baseline profiler (Track A, phase A1.3)
 //
 // Measures the current naive FP16 dot-product path (device_matvec /
@@ -17,7 +16,6 @@
 // Build (from cuda/):
 //   nvcc -std=c++17 -O3 --use_fast_math -Iinclude -arch=sm_86 \
 //        -o bench_gemm.exe src/bench_gemm.cu -lcublas
-// ============================================================================
 
 #include "utils.h"
 
@@ -50,7 +48,6 @@ __global__ void matvec_prefill_kernel(const float* gx, const half* W,
                       d_in, d_out);
 }
 
-// ----------------------------------------------------------------------------
 
 struct Op { const char* name; int d_in; int d_out; };
 

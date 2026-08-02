@@ -5,9 +5,7 @@
 #include <cfloat>
 #include <cstdint>
 
-// ============================================================================
 // Warp-level reductions using __shfl_xor_sync
-// ============================================================================
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -23,11 +21,9 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
-// ============================================================================
 // Block-level reductions  (all threads contribute one value)
 // Result is broadcast to all threads via smem[0].
 // smem must have at least ceil(blockDim.x / WARP_SIZE) float slots.
-// ============================================================================
 
 __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
     int tid     = threadIdx.x;
@@ -65,17 +61,15 @@ __device__ __forceinline__ float block_reduce_max(float val, float* smem) {
     return smem[0];
 }
 
-// ============================================================================
 // RMSNorm:  out[i] = (x[i] / rms(x)) * weight[i]
 //
 // Handles d > blockDim.x via stride loop: each thread accumulates
 // its assigned elements into the shared sum-of-squares, then normalises
 // the same elements in a second pass.
-// ============================================================================
 
 __device__ __forceinline__
-void device_rmsnorm(const float* x, const half* weight, float* out,
-                    int d, float* smem) {
+void device_rmsnorm(const float* __restrict__ x, const half* __restrict__ weight,
+                    float* __restrict__ out, int d, float* smem) {
     int tid = threadIdx.x;
 
     // Accumulate squared elements (stride loop for d > BLOCK_THREADS)
@@ -91,10 +85,8 @@ void device_rmsnorm(const float* x, const half* weight, float* out,
     __syncthreads();
 }
 
-// ============================================================================
 // In-place softmax over data[0..n-1] in shared memory.
 // Handles n > blockDim.x via stride loop.
-// ============================================================================
 
 __device__ __forceinline__
 void block_softmax_inplace(float* data, int n, float* smem) {
@@ -121,7 +113,6 @@ void block_softmax_inplace(float* data, int n, float* smem) {
     __syncthreads();
 }
 
-// ============================================================================
 // Argmax over a global-memory array data[0..n-1].
 // Handles n >> blockDim.x via stride loop.
 //
@@ -132,7 +123,6 @@ void block_softmax_inplace(float* data, int n, float* smem) {
 // Technique: store (max_val, best_idx) per thread; binary-tree reduce.
 // The int indices are bit-cast into the float scratch array to avoid a
 // separate smem allocation (safe in device code with __shared__).
-// ============================================================================
 
 __device__ __forceinline__
 int global_argmax(const float* data, int n, float* scratch) {
@@ -164,29 +154,49 @@ int global_argmax(const float* data, int n, float* scratch) {
     return s_idx[0];
 }
 
-// ============================================================================
 // Matrix-vector multiply:  out[d_out] = x[d_in] @ W[d_in, d_out]
 // W stored row-major in half precision: W[row * d_out + col].
-// x is in shared memory (float); out may be shared or global memory.
-// Each thread computes ceil(d_out / blockDim.x) output elements.
-// ============================================================================
+//
+// Fast path (even d_out): each thread owns a column pair and loads the two
+// weights with one 32-bit half2 load, accumulating into two independent
+// registers. Vectorised loads + dual accumulators hide load/FMA latency.
+// A half2 view is only 4-byte aligned per row when d_out is even, so odd
+// d_out (e.g. vocab = 50257) falls back to the scalar path.
 
 __device__ __forceinline__
-void device_matvec(const float* x, const half* W,
-                   float* out, int d_in, int d_out) {
+void device_matvec(const float* __restrict__ x, const half* __restrict__ W,
+                   float* __restrict__ out, int d_in, int d_out) {
     int tid = threadIdx.x;
-    for (int col = tid; col < d_out; col += blockDim.x) {
-        float acc = 0.0f;
-        for (int row = 0; row < d_in; row++)
-            acc += x[row] * __half2float(W[row * d_out + col]);
-        out[col] = acc;
+    if ((d_out & 1) == 0) {
+        int c2n = d_out >> 1;
+        const half2* __restrict__ W2 = reinterpret_cast<const half2*>(W);
+        for (int c2 = tid; c2 < c2n; c2 += blockDim.x) {
+            float acc0 = 0.0f, acc1 = 0.0f;
+            #pragma unroll 4
+            for (int row = 0; row < d_in; row++) {
+                float2 w  = __half22float2(W2[row * c2n + c2]);
+                float  xr = x[row];
+                acc0 += xr * w.x;
+                acc1 += xr * w.y;
+            }
+            out[2 * c2]     = acc0;
+            out[2 * c2 + 1] = acc1;
+        }
+    } else {
+        for (int col = tid; col < d_out; col += blockDim.x) {
+            float acc = 0.0f;
+            #pragma unroll 4
+            for (int row = 0; row < d_in; row++)
+                acc += x[row] * __half2float(W[row * d_out + col]);
+            out[col] = acc;
+        }
     }
     __syncthreads();
 }
 
 // out[i] += bias[i]  (no-op when bias == nullptr)
 __device__ __forceinline__
-void device_add_bias(float* out, const half* bias, int n) {
+void device_add_bias(float* __restrict__ out, const half* __restrict__ bias, int n) {
     if (!bias) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         out[i] += __half2float(bias[i]);
@@ -208,14 +218,15 @@ void device_add_bias_batched(float* g_out, const half* bias, int d_out, int B) {
 // Column slice: out[jc] = x @ W[:, col0+jc], jc in [0, ncol).
 // ncol may be smaller than blockDim.x; out must hold ncol floats contiguously.
 __device__ __forceinline__
-void device_matvec_cols(const float* x, const half* W,
+void device_matvec_cols(const float* __restrict__ x, const half* __restrict__ W,
                         int d_in, int d_out,
                         int col0, int ncol,
-                        float* out) {
+                        float* __restrict__ out) {
     int tid = threadIdx.x;
     for (int jc = tid; jc < ncol; jc += blockDim.x) {
         float acc = 0.0f;
         int col   = col0 + jc;
+        #pragma unroll 4
         for (int row = 0; row < d_in; row++)
             acc += x[row] * __half2float(W[row * d_out + col]);
         out[jc] = acc;
@@ -223,7 +234,6 @@ void device_matvec_cols(const float* x, const half* W,
     __syncthreads();
 }
 
-// ============================================================================
 // Batched matrix-vector multiply: reads W ONCE for all B input vectors.
 // g_x: [B * d_in] contiguous in global memory (batch-major).
 // g_out: [B * d_out] contiguous in global memory.
@@ -232,12 +242,11 @@ void device_matvec_cols(const float* x, const half* W,
 // register array that the compiler can fully unroll and keep in registers,
 // avoiding local-memory (L1/DRAM) spilling that occurs with runtime-sized arrays.
 // Runtime dispatch selects the right instantiation for B = 1..MAX_VERIFY_BATCH.
-// ============================================================================
 
 template <int B_CT>
 __device__ __forceinline__
-void device_matvec_batched_T(const float* g_x, const half* W,
-                              float* g_out, int d_in, int d_out) {
+void device_matvec_batched_T(const float* __restrict__ g_x, const half* __restrict__ W,
+                              float* __restrict__ g_out, int d_in, int d_out) {
     int tid = threadIdx.x;
     for (int col = tid; col < d_out; col += blockDim.x) {
         float acc[B_CT];
@@ -278,10 +287,10 @@ void device_matvec_batched(const float* g_x, const half* W,
 
 template <int B_CT>
 __device__ __forceinline__
-void device_matvec_cols_batched_T(const float* g_x, const half* W,
+void device_matvec_cols_batched_T(const float* __restrict__ g_x, const half* __restrict__ W,
                                    int d_in, int d_out,
                                    int col0, int ncol,
-                                   float* g_out) {
+                                   float* __restrict__ g_out) {
     int tid = threadIdx.x;
     for (int jc = tid; jc < ncol; jc += blockDim.x) {
         float acc[B_CT];
@@ -326,9 +335,9 @@ void device_matvec_cols_batched(const float* g_x, const half* W,
 
 template <int B_CT>
 __device__ __forceinline__
-void device_down_proj_accum_batched_T(const float* g_act, const half* W_down,
+void device_down_proj_accum_batched_T(const float* __restrict__ g_act, const half* __restrict__ W_down,
                                        int d, int dff, int r0, int ncol,
-                                       float* g_accum) {
+                                       float* __restrict__ g_accum) {
     int tid = threadIdx.x;
     for (int oc = tid; oc < d; oc += blockDim.x) {
         float dots[B_CT];
@@ -365,9 +374,7 @@ void device_down_proj_accum_batched(const float* g_act, const half* W_down,
     }
 }
 
-// ============================================================================
 // Scalar half->float element load helper (vectorised load left as TODO)
-// ============================================================================
 
 __device__ __forceinline__
 void load_half_to_float(const half* src, float* dst, int n, int tid, int stride) {
@@ -375,9 +382,7 @@ void load_half_to_float(const half* src, float* dst, int n, int tid, int stride)
         dst[i] = __half2float(src[i]);
 }
 
-// ============================================================================
 // CUDA error-checking macro
-// ============================================================================
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
@@ -389,9 +394,7 @@ void load_half_to_float(const half* src, float* dst, int n, int tid, int stride)
         }                                                                       \
     } while (0)
 
-// ============================================================================
 // cuBLAS error-checking macro (host code only)
-// ============================================================================
 
 #define CUBLAS_CHECK(call)                                                      \
     do {                                                                        \
@@ -403,7 +406,6 @@ void load_half_to_float(const half* src, float* dst, int n, int tid, int stride)
         }                                                                       \
     } while (0)
 
-// ============================================================================
 // device_matvec_partial
 //
 // Partial column-stripe matrix-vector multiply: computes
@@ -412,7 +414,6 @@ void load_half_to_float(const half* src, float* dst, int n, int tid, int stride)
 // Allows multiple cooperative blocks to split the output dimension, each
 // writing to a distinct stripe of the output array with no race conditions.
 // FP16 weights, FP32 accumulation.
-// ============================================================================
 __device__ __forceinline__ void device_matvec_partial(
         const float* __restrict__ x,      // [d_in]  input activation
         const half*  __restrict__ W,      // [d_in × d_out] row-major FP16 weights
@@ -423,15 +424,34 @@ __device__ __forceinline__ void device_matvec_partial(
     for (int oc = tid; oc < col_count; oc += blockDim.x) {
         float acc = 0.f;
         int c = col_start + oc;
+        #pragma unroll 4
         for (int r = 0; r < d_in; r++)
             acc += x[r] * __half2float(__ldg(&W[r * d_out + c]));
         out[c] = acc;
     }
 }
 
-// ============================================================================
+// Accumulating variant: out[stripe] += x @ W[:, stripe].  Used for the residual
+// projections (Wo, W_down) so each cooperative block folds its output stripe
+// straight into the resident hidden vector with no separate temp buffer.
+__device__ __forceinline__ void device_matvec_partial_accum(
+        const float* __restrict__ x,
+        const half*  __restrict__ W,
+        float*                    out,
+        int d_in, int d_out,
+        int col_start, int col_count) {
+    int tid = threadIdx.x;
+    for (int oc = tid; oc < col_count; oc += blockDim.x) {
+        float acc = 0.f;
+        int c = col_start + oc;
+        #pragma unroll 4
+        for (int r = 0; r < d_in; r++)
+            acc += x[r] * __half2float(__ldg(&W[r * d_out + c]));
+        out[c] += acc;
+    }
+}
+
 // Host-side alignment helper
-// ============================================================================
 
 inline size_t align_up(size_t x, size_t alignment) {
     return (x + alignment - 1) & ~(alignment - 1);

@@ -5,7 +5,6 @@
 #include <cublas_v2.h>
 #include <cstdint>
 
-// ============================================================================
 // Weight layout  (all tensors in half precision, 16-byte aligned on device)
 //
 // Attention projections use native GQA dimensions:
@@ -27,7 +26,6 @@
 //   token_embedding  [vocab_size, d_model]
 //   rms_final_weight [d_model]
 //   output_proj      [d_model, vocab_size]   (logits = normed @ output_proj)
-// ============================================================================
 
 struct LayerWeights {
     half* rms_attn_weight;   // [d_model]
@@ -108,12 +106,6 @@ __device__ int model_forward(const ModelWeights& model, KVCache& kv,
 
 // Batched forward: process B tokens through the model in one pass.
 // Reads each weight matrix ONCE for all B tokens (vs B times for sequential).
-// token_ids: [B] array in device-accessible memory.
-// g_hidden:  [B * d_model] global scratch for hidden states.
-// g_work:    [(7 * d_model + MLP_FF_TILE) * B] global scratch for intermediates.
-// g_logits:  [B * vocab_size] output logits for each position.
-// smem:      shared memory (same budget as single-token, sized for this model).
-// KV cache entries are appended at positions seq_base .. seq_base+B-1.
 __device__ void model_batch_forward_logits(
     const ModelWeights& model, KVCache& kv,
     const int* token_ids, int seq_base, int B,
@@ -143,12 +135,6 @@ __device__ void model_forward_verify_from_hidden_logits(
     const float* saved_hidden, int layer_start, int current_seq_len,
     float* hidden, float* g_logits, float* smem);
 
-// Self-spec anchor verify (position 0): embed -> prefix layers -> suffix layers -> logits.
-__device__ void model_forward_verify_anchor_logits(
-    const ModelWeights& model, KVCache& kv,
-    int token_id, int layer_start, int current_seq_len,
-    float* hidden, float* g_logits, float* smem);
-
 // Batched self-spec verify.  g_saved_hiddens[B*d_model]: saved[b] is the post-prefix
 // activation for verify position b (written during draft).  All positions load saved[b]
 // and share the suffix layer loop.
@@ -159,7 +145,6 @@ __device__ void model_batch_forward_selfspec_verify_logits(
     float* g_hidden, float* g_work, float* g_logits_out,
     float* smem);
 
-// ============================================================================
 // InferenceEngine — host-side state for cuBLAS handle, CUDA stream pool,
 // cooperative-launch capability, and scratch buffers for the cooperative
 // single-token decode kernel.
@@ -174,7 +159,6 @@ __device__ void model_batch_forward_selfspec_verify_logits(
 //   d_coop_hidden  / d_coop_scratch  -- used by target (stream[1]) or baseline
 //   d_coop_hidden2 / d_coop_scratch2 -- used by draft  (stream[0]) in parallel prefill
 // Both are sized for the LARGEST model passed to inference_engine_init.
-// ============================================================================
 struct InferenceEngine {
     cublasHandle_t cublas;
     cudaStream_t   streams[STREAM_POOL_SIZE];

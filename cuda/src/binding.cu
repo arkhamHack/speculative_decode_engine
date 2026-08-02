@@ -12,18 +12,13 @@
 
 namespace py = pybind11;
 
-// ============================================================================
-// run_benchmark: called from Python CLI.
-// Returns a dict with timing, tokens, and statistics.
-// ============================================================================
-
 static py::dict run_benchmark(const std::string& mode,
                               int max_tokens,
                               int spec_k,
                               int prompt_len) {
-    bool use_mega = (mode == "mega");
+    bool use_mega          = (mode == "mega" || mode == "mega_coop");
+    bool use_coop_baseline = (mode == "mega_coop");
 
-    // Validate
     if (max_tokens <= 0 || max_tokens > MAX_SEQ_LEN)
         throw std::runtime_error("max_tokens must be in [1, " +
                                   std::to_string(MAX_SEQ_LEN) + "]");
@@ -32,7 +27,6 @@ static py::dict run_benchmark(const std::string& mode,
     if (prompt_len <= 0 || prompt_len > MAX_SEQ_LEN / 2)
         throw std::runtime_error("prompt_len out of range");
 
-    // Allocate models
     ModelConfig draft_cfg  = make_draft_config();
     ModelConfig target_cfg = make_target_config();
 
@@ -40,13 +34,11 @@ static py::dict run_benchmark(const std::string& mode,
     model_alloc(draft_model, draft_cfg);
     model_alloc(target_model, target_cfg);
 
-    // KV caches
     KVCache draft_kv, target_kv, baseline_kv;
     kv_cache_alloc(draft_kv, draft_cfg.n_layers, kv_dim(draft_cfg), MAX_KV_BLOCKS);
     kv_cache_alloc(target_kv, target_cfg.n_layers, kv_dim(target_cfg), MAX_KV_BLOCKS);
     kv_cache_alloc(baseline_kv, target_cfg.n_layers, kv_dim(target_cfg), MAX_KV_BLOCKS);
 
-    // Prompt
     std::vector<int> h_prompt(prompt_len);
     for (int i = 0; i < prompt_len; i++)
         h_prompt[i] = (i + 1) % DEFAULT_VOCAB_SIZE;
@@ -72,7 +64,10 @@ static py::dict run_benchmark(const std::string& mode,
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
     CUDA_CHECK(cudaEventRecord(ev_start));
-    if (use_mega)
+    if (use_coop_baseline)
+        megakernel_baseline_coop(target_model, baseline_kv, d_prompt, prompt_len,
+                                 d_baseline_res, params);
+    else if (use_mega)
         megakernel_baseline(target_model, baseline_kv, d_prompt, prompt_len,
                             d_baseline_res, params);
     else
@@ -106,14 +101,12 @@ static py::dict run_benchmark(const std::string& mode,
     CUDA_CHECK(cudaMemcpy(&h_spec, d_spec_res,
                            sizeof(GenerationResult), cudaMemcpyDeviceToHost));
 
-    // Verify
     bool match = (h_baseline.n_generated == h_spec.n_generated);
     for (int i = 0; i < h_baseline.n_generated && match; i++) {
         if (h_baseline.output_tokens[i] != h_spec.output_tokens[i])
             match = false;
     }
 
-    // Build result dict
     py::dict result;
     result["mode"] = mode;
 
@@ -139,7 +132,6 @@ static py::dict run_benchmark(const std::string& mode,
     result["speedup"]            = baseline_ms / spec_ms;
     result["match"]              = match;
 
-    // Cleanup
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_stop));
     cudaFree(d_prompt);
@@ -153,10 +145,6 @@ static py::dict run_benchmark(const std::string& mode,
 
     return result;
 }
-
-// ============================================================================
-// pybind11 module definition
-// ============================================================================
 
 PYBIND11_MODULE(spec_decode_cuda, m) {
     m.doc() = "CUDA speculative decoding engine";

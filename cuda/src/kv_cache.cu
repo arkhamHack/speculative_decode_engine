@@ -3,9 +3,7 @@
 #include <cstdio>
 #include <cstring>
 
-// ============================================================================
 // Host API
-// ============================================================================
 
 void kv_cache_alloc(KVCache& cache, int n_layers, int d_head,
                     int max_blocks_per_layer) {
@@ -53,9 +51,7 @@ void kv_cache_reset(KVCache& cache) {
     CUDA_CHECK(cudaMemset(cache.seq_len, 0, sizeof(int)));
 }
 
-// ============================================================================
 // Device API
-// ============================================================================
 
 // Helper: pointer to the start of a physical block's data.
 // Layout: [K: KV_BLOCK_SIZE * d_head halfs][V: KV_BLOCK_SIZE * d_head halfs]

@@ -7,7 +7,7 @@ speculative decoding, and prints a comparison report.
 
 Usage:
     python cli/benchmark.py [--mode multi|mega] [--max-tokens N] [--k N]
-                            [--seed N] [--prompt-len N]
+                            [--prompt-len N]
 """
 
 import argparse
@@ -16,14 +16,14 @@ import sys
 def main():
     parser = argparse.ArgumentParser(
         description="CUDA speculative decoding benchmark")
-    parser.add_argument("--mode", choices=["multi", "mega"], default="multi",
-                        help="Kernel mode: multi-kernel or persistent megakernel")
+    parser.add_argument("--mode", choices=["multi", "mega", "mega_coop"],
+                        default="multi",
+                        help="Kernel mode: multi-kernel, persistent megakernel, "
+                             "or persistent cooperative (multi-SM) megakernel")
     parser.add_argument("--max-tokens", type=int, default=32,
                         help="Maximum new tokens to generate")
     parser.add_argument("--k", type=int, default=4,
                         help="Number of draft tokens per speculation round")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for weight initialization")
     parser.add_argument("--prompt-len", type=int, default=4,
                         help="Length of the dummy prompt")
     args = parser.parse_args()
@@ -38,18 +38,16 @@ def main():
         sys.exit(1)
 
     print(f"Running benchmark: mode={args.mode}, max_tokens={args.max_tokens}, "
-          f"k={args.k}, seed={args.seed}, prompt_len={args.prompt_len}")
+          f"k={args.k}, prompt_len={args.prompt_len}")
     print("=" * 60)
 
     result = spec_decode_cuda.run_benchmark(
         mode=args.mode,
         max_tokens=args.max_tokens,
         spec_k=args.k,
-        seed=args.seed,
         prompt_len=args.prompt_len,
     )
 
-    # Baseline results
     print(f"\n--- Baseline (target-only) ---")
     print(f"  Tokens generated: {result['baseline_n']}")
     print(f"  Time:             {result['baseline_ms']:.2f} ms")
@@ -57,7 +55,6 @@ def main():
     bl_tokens = result["baseline_tokens"]
     print(f"  Output:           {bl_tokens[:20]}{'...' if len(bl_tokens) > 20 else ''}")
 
-    # Speculative results
     print(f"\n--- Speculative (draft + target, k={args.k}) ---")
     print(f"  Tokens generated: {result['spec_n']}")
     print(f"  Time:             {result['spec_ms']:.2f} ms")
@@ -69,7 +66,6 @@ def main():
     sp_tokens = result["spec_tokens"]
     print(f"  Output:           {sp_tokens[:20]}{'...' if len(sp_tokens) > 20 else ''}")
 
-    # Comparison
     print(f"\n--- Comparison ---")
     print(f"  Speedup:          {result['speedup']:.2f}x")
     print(f"  Output match:     {'PASS' if result['match'] else 'FAIL'}")

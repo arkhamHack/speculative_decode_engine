@@ -3,11 +3,9 @@
 #include <cstdlib>
 #include <cstring>
 
-// ============================================================================
 // .tok file format:
 //   [4 bytes]  n  (uint32, number of tokens)
 //   [n*4 bytes] token_ids (uint32 each)
-// ============================================================================
 
 static bool read_tok_file(const char* path,
                           std::vector<int>& out_ids) {
@@ -51,9 +49,7 @@ static bool write_tok_file(const char* path,
     return true;
 }
 
-// ============================================================================
 // Tokenizer member functions
-// ============================================================================
 
 bool Tokenizer::load(const char* path) {
     return read_tok_file(path, ids);
@@ -63,9 +59,7 @@ bool Tokenizer::save(const char* path, const int* tok_ids, int n) const {
     return write_tok_file(path, tok_ids, n);
 }
 
-// ============================================================================
 // C helpers for use from main.cu without STL
-// ============================================================================
 
 int* tok_load_alloc(const char* path, int* out_n) {
     std::vector<int> v;

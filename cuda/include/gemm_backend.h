@@ -1,9 +1,8 @@
- m n #pragma once
+ #pragma once
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include "utils.h"
 
-// ============================================================================
 // GemmBackend — thin wrapper over cublasGemmEx for tensor-op GEMM.
 //
 // All GEMMs compute  C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
@@ -16,7 +15,6 @@
 //
 // This matches the weight layout (row-major half*) and the hidden state
 // layout (row-major float*) used throughout the engine.
-// ============================================================================
 
 struct GemmBackend {
     cublasHandle_t handle;

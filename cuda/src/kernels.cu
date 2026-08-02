@@ -25,7 +25,6 @@ static inline void cuda_configure_kernel_dynamic_smem(K kernel, size_t smem_byte
     }
 }
 
-// ============================================================================
 // Shared memory layout (dynamic — sized at launch via compute_smem_bytes())
 //
 //   shared[0          .. d_model)         hidden      [d_model]
@@ -35,7 +34,6 @@ static inline void cuda_configure_kernel_dynamic_smem(K kernel, size_t smem_byte
 // Logits are written to a global-memory buffer (g_logits) allocated by the
 // host wrapper.  This removes the vocab_size limit from shared memory and
 // allows real models with vocab_size >> 256.
-// ============================================================================
 
 // Forward pass only: populate g_logits (no argmax).
 __global__ void single_token_forward_logits_kernel(
@@ -49,12 +47,10 @@ __global__ void single_token_forward_logits_kernel(
     model_forward_logits(model, kv, token_id, seq_len, hidden, g_logits, smem);
 }
 
-// -----------------------------------------------------------------------------
 // Leviathan/Chen stochastic helpers (single block, logits in global memory)
 //
 // Scratch smem reused from the normed region prefix (>= warp reduction slots via
 // d_model floats is typical). After forward logits, hidden/norm/etc. are disposable.
-// -----------------------------------------------------------------------------
 
 // Read-only softmax mass at logits[idx]/temp (does not mutate logits array).
 __device__ float logits_softmax_prob_at_global(const float* logits, int V, int idx,
@@ -95,6 +91,48 @@ __device__ void logits_inplace_softmax_temp(float* logits, int V, float temperat
     __syncthreads();
 }
 
+// Block-parallel inverse-CDF sample from a probability array p[0..V) (sums ~1).
+// Draws u once on thread 0, then all threads cooperatively find the sampled index
+// (first i where prefix_sum(p[0..i]) >= u): each thread sums a contiguous slice,
+// an exclusive prefix over the blockDim slice-sums locates the slice holding u,
+// and that thread walks it. ~blockDim-fold faster than the serial O(V) walk;
+// equivalent up to float rounding at bin boundaries (a non-issue for sampling).
+__device__ __forceinline__ int device_sample_inverse_cdf(const float* p, int V,
+                                                         curandState* rng) {
+    __shared__ float s_seg[BLOCK_THREADS];   // per-thread slice sum, then prefix
+    __shared__ float s_u;
+    __shared__ int   s_pick;
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    if (tid == 0) { s_u = curand_uniform(rng); s_pick = V - 1; }
+    __syncthreads();
+
+    int seg = (V + nt - 1) / nt;             // contiguous slice per thread
+    int lo  = tid * seg;
+    int hi  = (lo + seg < V) ? lo + seg : V;
+
+    float local = 0.f;
+    for (int i = lo; i < hi; i++) local += p[i];
+    s_seg[tid] = local;
+    __syncthreads();
+
+    if (tid == 0) {                          // exclusive prefix over blockDim sums
+        float run = 0.f;
+        for (int t = 0; t < nt; t++) { float v = s_seg[t]; s_seg[t] = run; run += v; }
+    }
+    __syncthreads();
+
+    float base = s_seg[tid];                 // = sum(p[0 .. lo-1])
+    float u    = s_u;
+    if (lo < hi && u > base && u <= base + local) {
+        float acc = base;
+        for (int i = lo; i < hi; i++) { acc += p[i]; if (u <= acc) { s_pick = i; break; } }
+    }
+    __syncthreads();
+    return s_pick;
+}
+
 // Device-pointer variant: reads token_id from device memory so consecutive draft
 // steps can be chained without a CPU roundtrip between them.
 __global__ void stochastic_draft_forward_sample_dptr_kernel(
@@ -121,14 +159,8 @@ __global__ void stochastic_draft_forward_sample_dptr_kernel(
     float* softmax_scratch = hidden;
     logits_inplace_softmax_temp(g_logits, V, temperature, softmax_scratch);
 
+    int choice = device_sample_inverse_cdf(g_logits, V, rng);
     if (threadIdx.x == 0) {
-        float u      = curand_uniform(rng);
-        float cdf    = 0.f;
-        int   choice = V - 1;
-        for (int i = 0; i < V; i++) {
-            cdf += g_logits[i];
-            if (u <= cdf || i == V - 1) { choice = i; break; }
-        }
         sampled_id[0]     = choice;
         sampled_q_prob[0] = g_logits[choice];
     }
@@ -164,14 +196,8 @@ __global__ void stochastic_draft_forward_sample_save_dptr_kernel(
     float* softmax_scratch = hidden;
     logits_inplace_softmax_temp(g_logits, V, temperature, softmax_scratch);
 
+    int choice = device_sample_inverse_cdf(g_logits, V, rng);
     if (threadIdx.x == 0) {
-        float u      = curand_uniform(rng);
-        float cdf    = 0.f;
-        int   choice = V - 1;
-        for (int i = 0; i < V; i++) {
-            cdf += g_logits[i];
-            if (u <= cdf || i == V - 1) { choice = i; break; }
-        }
         sampled_id[0]     = choice;
         sampled_q_prob[0] = g_logits[choice];
     }
@@ -239,8 +265,8 @@ __global__ void target_fwd_prob_and_accept_selfspec_kernel(
             target_model, kv, saved_hidden, layer_start, seq_len,
             hidden, g_logits, lay_smem);
     else
-        model_forward_verify_anchor_logits(
-            target_model, kv, token_id, layer_start, seq_len,
+        model_forward_logits(
+            target_model, kv, token_id, seq_len,
             hidden, g_logits, lay_smem);
     __syncthreads();
 
@@ -436,28 +462,19 @@ __global__ void softmax_sample_temperature_kernel(float* logits,
                                                   float temperature,
                                                   curandState* rng,
                                                   int* out_token) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    float inv_t = temperature < 1e-6f ? 1e6f : 1.f / temperature;
-
-    float mx = -FLT_MAX;
-    for (int i = 0; i < V; i++)
-        mx = fmaxf(mx, logits[i] * inv_t);
-    float s = 0.f;
-    for (int i = 0; i < V; i++) {
-        logits[i] = expf(logits[i] * inv_t - mx);
-        s += logits[i];
-    }
-
-    float u_fix = curand_uniform(rng);
-    float cdf   = 0.f;
-    for (int i = 0; i < V; i++) {
-        cdf += logits[i] / s;
-        if (cdf >= u_fix || i == V - 1) {
-            out_token[0] = i;
-            return;
+    // Softmax is block-parallel (dominant cost at large vocab); the inverse-CDF
+    // draw stays on thread 0 so the RNG sequence is unchanged.
+    __shared__ float red[BLOCK_THREADS];
+    logits_inplace_softmax_temp(logits, V, temperature, red);   // logits → probs
+    if (threadIdx.x == 0) {
+        float u_fix = curand_uniform(rng);
+        float cdf   = 0.f;
+        for (int i = 0; i < V; i++) {
+            cdf += logits[i];
+            if (cdf >= u_fix || i == V - 1) { out_token[0] = i; return; }
         }
+        out_token[0] = V - 1;
     }
-    out_token[0] = V - 1;
 }
 
 // Sample from raw logits and also return the chosen token's probability mass.
@@ -467,29 +484,21 @@ __global__ void sample_from_logits_q_kernel(float* logits, int V,
                                             curandState* rng,
                                             int* sampled_id,
                                             float* sampled_q_prob) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    float inv_t = temperature < 1e-6f ? 1e6f : 1.f / temperature;
-
-    float mx = -FLT_MAX;
-    for (int i = 0; i < V; i++)
-        mx = fmaxf(mx, logits[i] * inv_t);
-    float s = 0.f;
-    for (int i = 0; i < V; i++) {
-        logits[i] = expf(logits[i] * inv_t - mx);
-        s += logits[i];
+    // Block-parallel softmax (dominant cost at large vocab), then a thread-0
+    // inverse-CDF draw — same RNG sequence as the single-thread version.
+    __shared__ float red[BLOCK_THREADS];
+    logits_inplace_softmax_temp(logits, V, temperature, red);   // logits → probs
+    if (threadIdx.x == 0) {
+        float u   = curand_uniform(rng);
+        float cdf = 0.f;
+        int choice = V - 1;
+        for (int i = 0; i < V; i++) {
+            cdf += logits[i];
+            if (u <= cdf || i == V - 1) { choice = i; break; }
+        }
+        sampled_id[0]     = choice;
+        sampled_q_prob[0] = logits[choice];
     }
-    for (int i = 0; i < V; i++)
-        logits[i] /= s;
-
-    float u   = curand_uniform(rng);
-    float cdf = 0.f;
-    int choice = V - 1;
-    for (int i = 0; i < V; i++) {
-        cdf += logits[i];
-        if (u <= cdf || i == V - 1) { choice = i; break; }
-    }
-    sampled_id[0]     = choice;
-    sampled_q_prob[0] = logits[choice];
 }
 
 // Stochastic accept gate from raw (unnormalized) target logits.
@@ -515,9 +524,7 @@ __global__ void rng_init_kernel(curandState* state,
         curand_init(seed_worker, 0ULL, 0ULL, state);
 }
 
-// ============================================================================
 //  MULTI-KERNEL PATH
-// ============================================================================
 
 // Single-token decode kernel.
 // g_logits: pre-allocated global-memory buffer of vocab_size floats.
@@ -538,6 +545,30 @@ __global__ void single_token_decode_kernel(
 // Update seq_len counter on device.
 __global__ void set_seq_len_kernel(int* seq_len_ptr, int val) {
     *seq_len_ptr = val;
+}
+
+// Batched stochastic accept gate: one launch computes the accept flag for all k
+// draft positions (vs one kernel + host sync per position). Each iteration does a
+// block-parallel softmax prob-mass of the drafted token in the target dist p, then
+// thread 0 applies the min(1, p/q) gate with a fresh RNG draw. The host then keeps
+// the longest accepted prefix. Replaces the per-token launch/sync/copy loop that
+// re-introduced the overhead the batched verify had just amortized away.
+__global__ void batch_stochastic_accept_kernel(
+        const float* g_logits, int V,
+        const int* draft_tokens, const float* q_probs, int k,
+        curandState* rng, int* accept_flags) {
+    extern __shared__ float shared[];
+    for (int vi = 0; vi < k; vi++) {
+        float pm = logits_softmax_prob_at_global(
+            g_logits + (size_t)vi * V, V, draft_tokens[vi], 1.f, shared);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float q_eff = fmaxf(q_probs[vi], 1e-36f);
+            float cap   = fminf(1.f, pm / q_eff);
+            accept_flags[vi] = (curand_uniform(rng) < cap) ? 1 : 0;
+        }
+        __syncthreads();
+    }
 }
 
 // Copy GenerationResult fields from device temp storage to result struct.
@@ -730,12 +761,10 @@ __global__ void batch_target_verify_coop_selfspec_kernel(
     if (threadIdx.x == 0) out_tokens[b] = next;
 }
 
-// ============================================================================
 // cuBLAS prefill utility kernels  (global kernels on global-memory buffers)
 //
 // These are ONLY used by the host-orchestrated cuBLAS prefill path.
 // The legacy device-internal paths use the __device__ functions in model.cu.
-// ============================================================================
 
 // Batched embedding: g_hidden[M, d] from token_ids[M]
 __global__ void cublas_embed_kernel(const half* token_embedding, const int* token_ids,
@@ -910,10 +939,8 @@ __global__ void cublas_attention_kernel(
         out_dst[i] = s_out[i];
 }
 
-// ============================================================================
 // Lazy-growth scratch allocator for cuBLAS forward paths.
 // Allocates on first call, grows (never shrinks) when M increases.
-// ============================================================================
 
 static void cublas_ensure_scratch(InferenceEngine& eng,
                                   const ModelConfig& cfg, int M) {
@@ -937,7 +964,6 @@ static void cublas_ensure_scratch(InferenceEngine& eng,
     }
 }
 
-// ============================================================================
 // Host-orchestrated cuBLAS forward pass.
 //
 // Handles prefill (M = prompt_len), decode (M = 1), and batched verify
@@ -953,7 +979,6 @@ static void cublas_ensure_scratch(InferenceEngine& eng,
 //   Final RMSNorm + output GEMM + argmax on ALL M tokens.
 //   g_logits must hold M * vocab_size floats.
 //   d_out_tokens must hold M ints.
-// ============================================================================
 
 static void cublas_forward(const ModelWeights& model, KVCache& kv,
                            const int* d_tokens, int M,
@@ -1344,8 +1369,6 @@ static void cublas_forward_from_hidden(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-// ---- Baseline (multi-kernel) ----
-
 // Forward declaration — full definition appears later in this file.
 static void launch_cooperative_decode_step(
     const ModelWeights& model, KVCache& kv,
@@ -1465,7 +1488,6 @@ void multikernel_baseline(const ModelWeights& target_model,
     if (d_tok_buf) cudaFree(d_tok_buf);
 }
 
-// ============================================================================
 // Cooperative parallel verify kernel
 //
 // Launches batch_size = k+1 thread blocks simultaneously.  Each block b
@@ -1487,7 +1509,6 @@ void multikernel_baseline(const ModelWeights& target_model,
 //
 // g_logits_batch: device buffer of shape [batch_size × vocab_size], one row per block.
 // out_tokens:     device buffer of shape [batch_size], written with argmax per block.
-// ============================================================================
 __global__ void batch_target_verify_coop_kernel(
         ModelWeights model, KVCache kv,
         const int* verify_tokens,   // [batch_size] device ptr
@@ -1538,7 +1559,6 @@ __global__ void batch_target_verify_coop_kernel(
     if (threadIdx.x == 0) out_tokens[b] = next;
 }
 
-// ============================================================================
 // cooperative_decode_kernel
 //
 // Multi-block single-token forward pass using cooperative groups:
@@ -1555,7 +1575,6 @@ __global__ void batch_target_verify_coop_kernel(
 // g_hidden  : [d_model]  residual stream (written by block 0 in Phase 1)
 // g_scratch : [d_model]  normed final hidden (written by block 0, read by all)
 // g_logits  : [vocab_size]  output logits (written by all blocks in Phase 2)
-// ============================================================================
 __global__ void cooperative_decode_kernel(
         ModelWeights model, KVCache kv,
         int token_id, int current_seq_len,
@@ -1606,8 +1625,6 @@ __global__ void cooperative_decode_kernel(
         if (tid == 0) *d_next_token = next;
     }
 }
-
-// ---- Speculative (multi-kernel) ----
 
 void multikernel_speculative(const ModelWeights& draft_model,
                              const ModelWeights& target_model,
@@ -1789,10 +1806,8 @@ void multikernel_speculative(const ModelWeights& draft_model,
 
     int* h_draft_tokens = new int[k];
 
-    // ---------------------------------------------------------------------
     // Stochastic speculative decoding (multi-kernel only; distribution-level
     // acceptance + adjusted rejection sampling vs greedy token identity).
-    // ---------------------------------------------------------------------
     if (params.stochastic_spec_decode) {
         if (draft_model.cfg.vocab_size != target_model.cfg.vocab_size) {
             fprintf(stderr,
@@ -1837,6 +1852,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
         CUDA_CHECK(cudaDeviceSynchronize());
 
         float* h_q_probs = new float[(size_t)k];
+        int*   h_accept_flags = new int[(size_t)k];   // batched accept flags (host)
         float  draft_temp_dyn = params.draft_temperature;
         float  ewma_accept    = -1.f;
 
@@ -1857,6 +1873,17 @@ void multikernel_speculative(const ModelWeights& draft_model,
         CUDA_CHECK(cudaMalloc(&d_q_probs_dev,      (size_t)k * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_ctx_seed,          sizeof(int)));
 
+        // cuBLAS self-spec (stochastic): batched suffix-verify logits for all k+1
+        // tokens in one pass, plus an (ignored) argmax scratch for the shared helper.
+        int    dim_t = target_model.cfg.d_model;
+        float* g_logits_verify_batch = nullptr;
+        int*   d_batch_verify_out    = nullptr;
+        if (use_cublas && params.self_speculative) {
+            CUDA_CHECK(cudaMalloc(&g_logits_verify_batch,
+                                  (size_t)(k + 1) * V_vocab * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_batch_verify_out, (size_t)(k + 1) * sizeof(int)));
+        }
+
         while (generated < max_new) {
             iterations++;
             int remaining = max_new - generated;
@@ -1871,12 +1898,45 @@ void multikernel_speculative(const ModelWeights& draft_model,
                                   cudaMemcpyHostToDevice));
             const int* d_ctx_ptr = d_ctx_seed;
 
-            if (use_cublas && !params.self_speculative) {
+            if (use_cublas && params.self_speculative) {
+                // Self-spec draft on cuBLAS: run the first n_draft_layers (prefix)
+                // and save the hidden, then finish the remaining layers to get logits,
+                // then sample stochastically. Mirrors the greedy cuBLAS draft but
+                // samples (with q-mass) instead of taking the argmax.
+                int cur = last_token;
+                for (int di = 0; di < current_k; di++) {
+                    CUDA_CHECK(cudaMemcpy(d_ctx_seed, &cur, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_prefix_save(target_model, draft_kv, d_ctx_seed, 1,
+                                       draft_seq, params.n_draft_layers,
+                                       d_selfspec_hiddens + (size_t)di * dim_t, *eng);
+                    cublas_forward_from_hidden(
+                        target_model, draft_kv,
+                        d_selfspec_hiddens + (size_t)di * dim_t, 1,
+                        draft_seq, params.n_draft_layers,
+                        g_logits_draft, d_next, *eng);
+                    sample_from_logits_q_kernel<<<1, BLOCK_THREADS>>>(
+                        g_logits_draft, V_vocab, draft_temp_dyn, d_rng,
+                        d_draft_tokens_dev + di, d_q_probs_dev + di);
+                    CUDA_CHECK(cudaMemcpy(&cur, d_draft_tokens_dev + di,
+                                          sizeof(int), cudaMemcpyDeviceToHost));
+                    draft_seq++;
+                }
+                // Bonus prefix hidden (index current_k) for the batched verify.
+                if (current_k > 0) {
+                    CUDA_CHECK(cudaMemcpy(d_ctx_seed, &cur, sizeof(int),
+                                          cudaMemcpyHostToDevice));
+                    cublas_prefix_save(target_model, draft_kv, d_ctx_seed, 1,
+                                       draft_seq, params.n_draft_layers,
+                                       d_selfspec_hiddens +
+                                           (size_t)current_k * dim_t, *eng);
+                }
+            } else if (use_cublas && !params.self_speculative) {
                 for (int di = 0; di < current_k; di++) {
                     cublas_forward(draft_model, draft_kv, d_ctx_ptr, 1,
                                    draft_seq, g_logits_draft,
                                    d_draft_tokens_dev + di, *eng);
-                    sample_from_logits_q_kernel<<<1, 1>>>(
+                    sample_from_logits_q_kernel<<<1, BLOCK_THREADS>>>(
                         g_logits_draft, V_vocab, draft_temp_dyn, d_rng,
                         d_draft_tokens_dev + di, d_q_probs_dev + di);
                     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1907,7 +1967,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
                     set_seq_len_kernel<<<1, 1>>>(draft_kv.seq_len, draft_seq);
                 }
             }
-            if (params.self_speculative && current_k > 0) {
+            if (!use_cublas && params.self_speculative && current_k > 0) {
                 selfspec_bonus_prefix_save_dptr_kernel<<<1, BLOCK_THREADS, draft_smem>>>(
                     target_model, draft_kv,
                     d_draft_tokens_dev + (current_k - 1), draft_seq,
@@ -1929,6 +1989,54 @@ void multikernel_speculative(const ModelWeights& draft_model,
             bool broke_early    = false;
             int  target_roll    = target_seq_save;
 
+            if (use_cublas && params.self_speculative) {
+                // Batched cuBLAS self-spec verify: one suffix pass over all k+1
+                // tokens from their saved prefix hiddens, then stochastic accept /
+                // adjusted-rejection sampling on the precomputed logits. KV commit
+                // and rollback follow the shared (greedy-style) logic below.
+                cublas_forward_from_hidden(
+                    target_model, target_kv, d_selfspec_hiddens, current_k + 1,
+                    target_seq_save, params.n_draft_layers,
+                    g_logits_verify_batch, d_batch_verify_out, *eng);
+
+                // One batched pass computes every accept flag (no per-token sync).
+                size_t accept_smem = (size_t)BLOCK_THREADS * sizeof(float);
+                batch_stochastic_accept_kernel<<<1, BLOCK_THREADS, accept_smem>>>(
+                    g_logits_verify_batch, V_vocab,
+                    d_draft_tokens_dev, d_q_probs_dev, current_k,
+                    d_rng, d_batch_verify_out);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(cudaMemcpy(h_accept_flags, d_batch_verify_out,
+                                      (size_t)current_k * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                for (int vi = 0; vi < current_k; vi++) {
+                    if (h_accept_flags[vi]) { n_accept_round++; continue; }
+
+                    // Reject: recover draft dist q at vi from its saved prefix hidden,
+                    // then sample the correction norm(max(0, p - q)).
+                    broke_early = true;
+                    cublas_forward_from_hidden(
+                        target_model, draft_kv,
+                        d_selfspec_hiddens + (size_t)vi * dim_t, 1,
+                        draft_seq_save + vi, params.n_draft_layers,
+                        g_logits_draft, d_next, *eng);
+                    corrected_sample_adjusted_logits_kernel<<<1, 1>>>(
+                        g_logits_verify_batch + (size_t)vi * V_vocab,
+                        g_logits_draft, V_vocab, d_rng, d_next, d_corr_work,
+                        1.f, draft_temp_dyn);
+                    CUDA_CHECK(cudaMemcpy(&bonus, d_next, sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+                    break;
+                }
+                if (!broke_early) {
+                    // All k accepted: bonus is sampled from the last verify position.
+                    softmax_sample_temperature_kernel<<<1, BLOCK_THREADS>>>(
+                        g_logits_verify_batch + (size_t)current_k * V_vocab,
+                        V_vocab, 1.f, d_rng, d_next);
+                    CUDA_CHECK(cudaMemcpy(&bonus, d_next, sizeof(int),
+                                          cudaMemcpyDeviceToHost));
+                }
+            } else
             for (int vi = 0; vi < current_k; vi++) {
                 int inp = (vi == 0) ? last_token : h_draft_tokens[vi - 1];
 
@@ -2036,7 +2144,7 @@ void multikernel_speculative(const ModelWeights& draft_model,
                     CUDA_CHECK(cudaDeviceSynchronize());
                 }
 
-                softmax_sample_temperature_kernel<<<1, 1>>>(
+                softmax_sample_temperature_kernel<<<1, BLOCK_THREADS>>>(
                     g_logits_target, V_vocab, 1.f, d_rng, d_next);
                 CUDA_CHECK(cudaDeviceSynchronize());
                 CUDA_CHECK(cudaMemcpy(&bonus, d_next, sizeof(int),
@@ -2125,10 +2233,13 @@ void multikernel_speculative(const ModelWeights& draft_model,
         }
 
         delete[] h_q_probs;
+        delete[] h_accept_flags;
         cudaFree(d_ctx_seed);
         cudaFree(d_q_probs_dev);
         cudaFree(d_draft_tokens_dev);
         if (d_selfspec_hiddens_local) cudaFree(d_selfspec_hiddens_local);
+        if (g_logits_verify_batch) cudaFree(g_logits_verify_batch);
+        if (d_batch_verify_out)    cudaFree(d_batch_verify_out);
         cudaFree(d_corr_work);
         cudaFree(d_accept);
         cudaFree(d_rng);
@@ -2422,13 +2533,11 @@ void multikernel_speculative(const ModelWeights& draft_model,
     if (d_tok_buf) cudaFree(d_tok_buf);
 }
 
-// ============================================================================
 // launch_cooperative_decode_step  (definition; forward-declared above)
 //
 // Launches cooperative_decode_kernel with a grid sized to cover all vocab
 // columns in parallel, capped to the device's cooperative-launch limit.
 // Falls back gracefully to 1 block if max_coop_blocks == 0.
-// ============================================================================
 static void launch_cooperative_decode_step(
         const ModelWeights& model, KVCache& kv,
         int token_id, int seq_len,
@@ -2481,7 +2590,6 @@ static void launch_cooperative_decode_step(
         args, smem, stream));
 }
 
-// ============================================================================
 //  PERSISTENT MEGAKERNEL PATH
 //
 //  A single kernel runs the entire generation loop on the GPU.
@@ -2489,9 +2597,6 @@ static void launch_cooperative_decode_step(
 //
 //  TODO: For multi-block / larger models, extend with cooperative-group
 //        grid-level barriers instead of __syncthreads().
-// ============================================================================
-
-// ---- Megakernel: Baseline ----
 
 // ModelWeights/KVCache are large (e.g. layers[MAX_LAYERS]); passing them by value
 // overflows the 4 KiB CUDA kernel parameter limit. Pass device pointers instead.
@@ -2556,7 +2661,203 @@ __global__ void megakernel_baseline_kernel(
     }
 }
 
-// ---- Megakernel: Speculative ----
+// ---- Megakernel: Baseline, persistent + cooperative (multi-SM) ----
+//
+// The whole generation loop lives in one cooperative launch: block 0 runs the
+// transformer body, then every block splits the output-projection GEMV across
+// SMs. g_ctrl holds the loop state in global memory so all blocks agree after
+// each grid.sync(): [0]=cur_token [1]=seq_len [2]=generated [3]=done.
+//
+// Every block executes the same barrier sequence every iteration (the done
+// flag gates work, never a grid.sync) so the grid can never deadlock.
+// Cooperative (multi-SM) single-token transformer layer. Every block streams a
+// column-stripe of each weight matrix (Wq/Wk/Wv/Wo/gate/up/down) via the
+// device_matvec_partial helpers, so the bandwidth-dominant projections span all
+// SMs instead of one block. RMSNorm is recomputed locally per block (cheap, O(d),
+// avoids a global buffer + barrier); RoPE, KV append and attention (KV-bound,
+// small at low context) run on block 0. grid.sync() separates dependent phases.
+//
+// Global scratch (all [.] resident across the layer): g_hidden [d] residual,
+// g_q [d], g_k/g_v [kd], g_attn [d], g_gate [d_ff].  smem holds this block's
+// local normed vector + reduction/attention scratch.
+__device__ void coop_layer_forward(
+        const ModelWeights& model, int l, KVCache& kv, int seq,
+        float* g_hidden, float* g_q, float* g_k, float* g_v,
+        float* g_attn, float* g_gate, float* smem,
+        cg::grid_group& grid) {
+    const LayerWeights& lw = model.layers[l];
+    const int d   = model.cfg.d_model;
+    const int dff = model.cfg.d_ff;
+    const int nh  = model.cfg.n_heads;
+    const int nkv = model.cfg.n_kv_heads;
+    const int dph = d / nh;
+    const int kd  = nkv * dph;
+    const int nb  = (int)gridDim.x;
+    const int bx  = (int)blockIdx.x;
+    const int tid = threadIdx.x;
+
+    float* s_normed  = smem;       // [d] this block's normed input
+    float* s_scratch = smem + d;   // reduction / attention scratch
+
+    // ---- attention RMSNorm (recomputed locally by every block) ----
+    device_rmsnorm(g_hidden, lw.rms_attn_weight, s_normed, d, s_scratch);
+
+    // ---- Q / K / V projections, output columns split across blocks ----
+    for (int ct = bx; ct * GEMV_COL_TILE < d; ct += nb) {
+        int cs = ct * GEMV_COL_TILE;
+        int cc = (cs + GEMV_COL_TILE <= d) ? GEMV_COL_TILE : (d - cs);
+        device_matvec_partial(s_normed, lw.Wq, g_q, d, d, cs, cc);
+        if (lw.Wq_bias)
+            for (int i = tid; i < cc; i += blockDim.x)
+                g_q[cs + i] += __half2float(lw.Wq_bias[cs + i]);
+    }
+    for (int ct = bx; ct * GEMV_COL_TILE < kd; ct += nb) {
+        int cs = ct * GEMV_COL_TILE;
+        int cc = (cs + GEMV_COL_TILE <= kd) ? GEMV_COL_TILE : (kd - cs);
+        device_matvec_partial(s_normed, lw.Wk, g_k, d, kd, cs, cc);
+        device_matvec_partial(s_normed, lw.Wv, g_v, d, kd, cs, cc);
+        for (int i = tid; i < cc; i += blockDim.x) {
+            if (lw.Wk_bias) g_k[cs + i] += __half2float(lw.Wk_bias[cs + i]);
+            if (lw.Wv_bias) g_v[cs + i] += __half2float(lw.Wv_bias[cs + i]);
+        }
+    }
+    grid.sync();
+
+    // ---- RoPE + KV append + attention on block 0 (KV-bound, cheap) ----
+    if (bx == 0) {
+        rope_apply_inplace(g_q, nh, dph, seq, model.cfg.rope_theta,
+                           model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+        rope_apply_inplace(g_k, nkv, dph, seq, model.cfg.rope_theta,
+                           model.cfg.rope_scaling_type, model.cfg.rope_scaling_factor);
+        kv_cache_append(kv, l, g_k, g_v, seq);
+        for (int i = tid; i < d; i += blockDim.x) g_attn[i] = 0.f;
+        __syncthreads();
+        __shared__ float s_m, s_l, s_tm, s_al, s_iv;
+        device_attention_dispatch(model.cfg.attention_type, g_q, g_attn, kv, l,
+                                  nh, nkv, dph, seq + 1, s_scratch,
+                                  s_m, s_l, s_tm, s_al, s_iv);
+    }
+    grid.sync();
+
+    // ---- output projection: g_hidden += Wo(attn), split across blocks ----
+    for (int ct = bx; ct * GEMV_COL_TILE < d; ct += nb) {
+        int cs = ct * GEMV_COL_TILE;
+        int cc = (cs + GEMV_COL_TILE <= d) ? GEMV_COL_TILE : (d - cs);
+        device_matvec_partial_accum(g_attn, lw.Wo, g_hidden, d, d, cs, cc);
+    }
+    grid.sync();
+
+    // ---- MLP RMSNorm (local) ----
+    device_rmsnorm(g_hidden, lw.rms_mlp_weight, s_normed, d, s_scratch);
+
+    // ---- gate/up + SwiGLU fused, d_ff split across blocks ----
+    for (int ct = bx; ct * GEMV_COL_TILE < dff; ct += nb) {
+        int cs = ct * GEMV_COL_TILE;
+        int cc = (cs + GEMV_COL_TILE <= dff) ? GEMV_COL_TILE : (dff - cs);
+        for (int oc = tid; oc < cc; oc += blockDim.x) {
+            int c = cs + oc;
+            float g = 0.f, u = 0.f;
+            #pragma unroll 4
+            for (int r = 0; r < d; r++) {
+                float xr = s_normed[r];
+                g += xr * __half2float(__ldg(&lw.W_gate[r * dff + c]));
+                u += xr * __half2float(__ldg(&lw.W_up[r * dff + c]));
+            }
+            g_gate[c] = (g / (1.0f + expf(-g))) * u;   // silu(gate) * up
+        }
+    }
+    grid.sync();
+
+    // ---- down projection: g_hidden += W_down(swiglu), split across blocks ----
+    for (int ct = bx; ct * GEMV_COL_TILE < d; ct += nb) {
+        int cs = ct * GEMV_COL_TILE;
+        int cc = (cs + GEMV_COL_TILE <= d) ? GEMV_COL_TILE : (d - cs);
+        device_matvec_partial_accum(g_gate, lw.W_down, g_hidden, dff, d, cs, cc);
+    }
+    grid.sync();
+}
+
+__global__ void megakernel_baseline_coop_kernel(
+        const ModelWeights* p_model, KVCache* p_kv,
+        const int* prompt, int prompt_len, int max_new_tokens,
+        float* g_hidden, float* g_scratch, float* g_logits,
+        int* g_ctrl, GenerationResult* result, int eos_token,
+        float* g_q, float* g_k, float* g_v, float* g_attn, float* g_gate) {
+    const ModelWeights& model = *p_model;
+    KVCache&            kv    = *p_kv;
+    auto grid = cg::this_grid();
+
+    extern __shared__ float smem[];
+    const int tid = threadIdx.x;
+    const int d   = model.cfg.d_model;
+    const int V   = model.cfg.vocab_size;
+
+    if (blockIdx.x == 0 && tid == 0) {
+        g_ctrl[0] = 0; g_ctrl[1] = 0; g_ctrl[2] = 0; g_ctrl[3] = 0;
+    }
+    grid.sync();
+
+    int total_fwd = prompt_len + (max_new_tokens > 0 ? max_new_tokens - 1 : 0);
+
+    for (int f = 0; f < total_fwd; f++) {
+        int done = g_ctrl[3];
+        int seq  = g_ctrl[1];
+
+        // Embed the input token into the resident hidden vector (block 0).
+        if (!done && blockIdx.x == 0) {
+            int input_tok = (f < prompt_len) ? prompt[f] : g_ctrl[0];
+            model_embed(model, input_tok, g_hidden);
+        }
+        grid.sync();
+
+        // Per-layer forward, every projection streamed across all SMs.
+        if (!done) {
+            for (int l = 0; l < model.cfg.n_layers; l++)
+                coop_layer_forward(model, l, kv, seq, g_hidden,
+                                   g_q, g_k, g_v, g_attn, g_gate, smem, grid);
+        }
+
+        // Final RMSNorm (block 0) feeds the split vocab projection below.
+        if (!done && blockIdx.x == 0)
+            device_rmsnorm(g_hidden, model.rms_final_weight, g_scratch, d, smem + d);
+        grid.sync();
+
+        if (!done) {
+            for (int ct = (int)blockIdx.x; ct * GEMV_COL_TILE < V; ct += (int)gridDim.x) {
+                int cs = ct * GEMV_COL_TILE;
+                int cc = (cs + GEMV_COL_TILE <= V) ? GEMV_COL_TILE : (V - cs);
+                device_matvec_partial(g_scratch, model.output_proj, g_logits, d, V, cs, cc);
+            }
+        }
+        grid.sync();
+
+        if (!done && blockIdx.x == 0) {
+            int next = global_argmax(g_logits, V, smem);
+            if (tid == 0) {
+                int out_idx = f - prompt_len + 1;
+                if (out_idx >= 0 && out_idx < max_new_tokens) {
+                    result->output_tokens[out_idx] = next;
+                    g_ctrl[2] = out_idx + 1;
+                    if ((eos_token >= 0 && next == eos_token) ||
+                        out_idx + 1 >= max_new_tokens)
+                        g_ctrl[3] = 1;
+                }
+                g_ctrl[0]   = next;
+                g_ctrl[1]   = seq + 1;
+                *kv.seq_len = seq + 1;
+            }
+        }
+        grid.sync();
+    }
+
+    if (blockIdx.x == 0 && tid == 0) {
+        result->n_generated     = g_ctrl[2];
+        result->draft_proposed  = 0;
+        result->draft_accepted  = 0;
+        result->spec_iterations = 0;
+    }
+}
+
 // s_draft/target_tokens are sized for spec_k up to MAX_MEGA_K.
 constexpr int MAX_MEGA_K = 16;
 
@@ -2951,17 +3252,8 @@ __global__ void megakernel_speculative_stochastic_kernel(
                                         scratch);
             __syncthreads();
 
+            int pick_w = device_sample_inverse_cdf(logits_draft, V_vocab, &s_rng);
             if (tid == 0) {
-                float cu = curand_uniform(&s_rng);
-                float acc = 0.f;
-                int   pick_w = V_vocab - 1;
-                for (int z = 0; z < V_vocab; z++) {
-                    acc += logits_draft[z];
-                    if (cu <= acc || z == V_vocab - 1) {
-                        pick_w = z;
-                        break;
-                    }
-                }
                 s_draft_ids[di] = pick_w;
                 s_q_probs[di]   = logits_draft[pick_w];
                 s_cur_in        = pick_w;
@@ -3188,10 +3480,6 @@ __global__ void megakernel_speculative_stochastic_kernel(
     }
 }
 
-// ============================================================================
-// Host wrappers for megakernel launches
-// ============================================================================
-
 void megakernel_baseline(const ModelWeights& target_model,
                          KVCache& target_kv,
                          const int* prompt, int prompt_len,
@@ -3222,6 +3510,84 @@ void megakernel_baseline(const ModelWeights& target_model,
     cudaFree(d_target_model);
     cudaFree(d_target_kv);
     cudaFree(g_logits);
+}
+
+// Persistent cooperative baseline: whole decode loop in one multi-SM launch.
+// Falls back to the single-block megakernel when the device lacks cooperative
+// launch support.
+void megakernel_baseline_coop(const ModelWeights& target_model,
+                              KVCache& target_kv,
+                              const int* prompt, int prompt_len,
+                              GenerationResult* d_result,
+                              const GenerationParams& params) {
+    int dev = 0; CUDA_CHECK(cudaGetDevice(&dev));
+    int coop_attr = 0;
+    cudaDeviceGetAttribute(&coop_attr, cudaDevAttrCooperativeLaunch, dev);
+    if (!coop_attr) {
+        megakernel_baseline(target_model, target_kv, prompt, prompt_len,
+                            d_result, params);
+        return;
+    }
+
+    const int d   = target_model.cfg.d_model;
+    const int V   = target_model.cfg.vocab_size;
+    const int kd  = target_model.cfg.n_kv_heads * (d / target_model.cfg.n_heads);
+    const int dff = target_model.cfg.d_ff;
+
+    kv_cache_reset(target_kv);
+    size_t smem_bytes = compute_smem_bytes(target_model.cfg);
+    cuda_configure_kernel_dynamic_smem(megakernel_baseline_coop_kernel, smem_bytes);
+
+    float *g_hidden, *g_scratch, *g_logits;
+    int   *g_ctrl;
+    CUDA_CHECK(cudaMalloc(&g_hidden,  (size_t)d * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_scratch, (size_t)d * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_logits,  (size_t)V * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_ctrl,    4 * sizeof(int)));
+
+    // Per-layer cooperative scratch (resident across the whole decode loop).
+    float *g_q, *g_k, *g_v, *g_attn, *g_gate;
+    CUDA_CHECK(cudaMalloc(&g_q,    (size_t)d   * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_k,    (size_t)kd  * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_v,    (size_t)kd  * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_attn, (size_t)d   * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_gate, (size_t)dff * sizeof(float)));
+
+    ModelWeights* d_model; KVCache* d_kv;
+    CUDA_CHECK(cudaMalloc(&d_model, sizeof(ModelWeights)));
+    CUDA_CHECK(cudaMalloc(&d_kv,    sizeof(KVCache)));
+    CUDA_CHECK(cudaMemcpy(d_model, &target_model, sizeof(ModelWeights),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kv, &target_kv, sizeof(KVCache),
+                          cudaMemcpyHostToDevice));
+
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, (void*)megakernel_baseline_coop_kernel,
+        BLOCK_THREADS, smem_bytes);
+    if (blocks_per_sm < 1) blocks_per_sm = 1;
+    int sm_count = 1;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+
+    int n_blocks = (V + GEMV_COL_TILE - 1) / GEMV_COL_TILE;
+    int hard_limit = sm_count * blocks_per_sm;
+    if (n_blocks > hard_limit) n_blocks = hard_limit;
+    if (n_blocks < 1)          n_blocks = 1;
+
+    void* args[] = {
+        (void*)&d_model, (void*)&d_kv, (void*)&prompt, (void*)&prompt_len,
+        (void*)&params.max_new_tokens, (void*)&g_hidden, (void*)&g_scratch,
+        (void*)&g_logits, (void*)&g_ctrl, (void*)&d_result, (void*)&params.eos_token,
+        (void*)&g_q, (void*)&g_k, (void*)&g_v, (void*)&g_attn, (void*)&g_gate
+    };
+    CUDA_CHECK(cudaLaunchCooperativeKernel(
+        (void*)megakernel_baseline_coop_kernel,
+        dim3(n_blocks), dim3(BLOCK_THREADS), args, smem_bytes, nullptr));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_model); cudaFree(d_kv);
+    cudaFree(g_hidden); cudaFree(g_scratch); cudaFree(g_logits); cudaFree(g_ctrl);
+    cudaFree(g_q); cudaFree(g_k); cudaFree(g_v); cudaFree(g_attn); cudaFree(g_gate);
 }
 
 void megakernel_speculative(const ModelWeights& draft_model,

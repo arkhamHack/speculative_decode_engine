@@ -5,7 +5,6 @@
 #include <cfloat>
 #include <cmath>
 
-// ============================================================================
 // Tiled causal flash-attention over a paged KV cache (GQA-aware).
 //
 // Computes attn_out[d_model] = concat_h( softmax(Q_h @ K^T / sqrt(dph)) @ V )
@@ -18,7 +17,6 @@
 //   - The five shared scalars must be declared __shared__ by the caller.
 //
 // The function is cooperative across the thread block (uses __syncthreads).
-// ============================================================================
 
 __device__ inline void device_flash_attention_gqa(
     const float* __restrict__ q_all,
@@ -130,7 +128,6 @@ __device__ inline void device_flash_attention_gqa(
     }
 }
 
-// ============================================================================
 // Attention dispatch — routes to the correct attention backend based on type.
 //
 // Currently only ATTN_SOFTMAX is implemented.  Adding a new backend requires:
@@ -139,7 +136,6 @@ __device__ inline void device_flash_attention_gqa(
 //   3. Add a case to this switch
 //   4. Update model_load_weights to parse the attention type from the header
 //   5. Update export_model.py to write the attention type
-// ============================================================================
 
 __device__ inline void device_attention_dispatch(
     AttentionType attn_type,

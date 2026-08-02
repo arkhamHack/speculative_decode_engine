@@ -9,12 +9,11 @@
 #include <cstring>
 #include <string>
 
-// ============================================================================
 // Argument parsing
-// ============================================================================
 
 struct Args {
     bool   use_mega     = false;           // --mode=mega
+    bool   use_coop     = false;           // --mode=mega_coop (multi-SM baseline)
     int    max_new      = 32;              // --max-tokens=N
     int    spec_k       = DEFAULT_SPEC_K;  // --k=N
     int    prompt_len   = 4;              // --prompt-len=N  (dummy tokenizer only)
@@ -96,6 +95,7 @@ static void parse_args(Args& args, int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--mode=", 7) == 0) {
             args.use_mega = strcmp(argv[i] + 7, "mega") == 0;
+            args.use_coop = strcmp(argv[i] + 7, "mega_coop") == 0;
         } else if (strncmp(argv[i], "--max-tokens=", 13) == 0) {
             args.max_new = atoi(argv[i] + 13);
         } else if (strncmp(argv[i], "--k=", 4) == 0) {
@@ -156,9 +156,7 @@ static void parse_args(Args& args, int argc, char** argv) {
         args.spec_only = true;
 }
 
-// ============================================================================
 // Print helpers
-// ============================================================================
 
 static void print_tokens(const char* label, const int* tokens, int n) {
     // Web UI parsing (runner._parse_token_list) requires digits/spaces only after ':' on
@@ -180,9 +178,7 @@ static void trim_inplace(char* s) {
     }
 }
 
-// ============================================================================
 // Persistent session — models / KV / engine loaded once
-// ============================================================================
 
 struct Session {
     Args             args;
@@ -253,7 +249,11 @@ static bool session_generate(Session& s, const int* h_prompt, int prompt_len,
     if (s.do_baseline) {
         printf("\n=== Baseline (target-only) ===\n");
         CUDA_CHECK(cudaEventRecord(s.ev_start));
-        if (s.args.use_mega) {
+        if (s.args.use_coop) {
+            megakernel_baseline_coop(s.target_model, s.baseline_kv,
+                                     s.d_prompt, prompt_len, s.d_baseline_result,
+                                     s.params);
+        } else if (s.args.use_mega) {
             megakernel_baseline(s.target_model, s.baseline_kv,
                                 s.d_prompt, prompt_len, s.d_baseline_result,
                                 s.params);
@@ -465,9 +465,7 @@ static void run_repl(Session& s) {
     printf("\nLeaving REPL.\n");
 }
 
-// ============================================================================
 // Main
-// ============================================================================
 
 int main(int argc, char** argv) {
     Session s;
